@@ -171,6 +171,14 @@ def test_stats_relay_allowlist_covers_every_device_stat():
     assert body, "could not locate the stats handler allowlist"
     allowlist = set(re.findall(r'"(\w+)":\s*msg\.get', body.group(1)))
 
+    # RTT is measured controller-side rather than relayed from the device
+    # message, so it reaches record_device_stats through Device.drain_rtt()
+    # merged into the same dict. Same failure mode, different source: a key
+    # the DB writer reads but drain_rtt never emits is silently always NULL.
+    drain = re.search(r"def drain_rtt\(.*?\n(?=    def |\n\n)", ctrl, re.S)
+    assert drain, "could not locate Device.drain_rtt"
+    allowlist |= set(re.findall(r'"(\w+)":', drain.group(0)))
+
     record = re.search(r"def record_device_stats\(.*?\n(?=def )", dbsrc, re.S)
     assert record, "could not locate record_device_stats"
     consumed = set(re.findall(r'stats\.get\("(\w+)"\)', record.group(0)))
@@ -180,3 +188,259 @@ def test_stats_relay_allowlist_covers_every_device_stat():
         f"record_device_stats reads {missing} but the em_controller stats "
         f"handler never copies them — they will always be None"
     )
+
+
+# ─── v9 — control-plane RTT ──────────────────────────────────────────────────
+
+def test_migrates_to_head(fresh_db):
+    """Head of MIGRATIONS, so appending one without bumping its own
+    schema_version statement fails here rather than in production."""
+    expected = str(len(db.MIGRATIONS))
+    assert db._q1("SELECT value FROM system_config WHERE key='schema_version'")["value"] == expected
+
+
+def test_rtt_accumulates_and_keeps_extremes(fresh_db):
+    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.record_device_stats("dev1", {
+        "cpuPct": 5.0, "memUsedMb": 100,
+        "rttSumMs": 300, "rttSamples": 6, "rttMinMs": 30, "rttMaxMs": 90,
+        "rttExcursions": 0, "rttExcursionsIdle": 0,
+    })
+    db.record_device_stats("dev1", {
+        "cpuPct": 5.0, "memUsedMb": 100,
+        "rttSumMs": 1400, "rttSamples": 6, "rttMinMs": 40, "rttMaxMs": 1100,
+        "rttExcursions": 2, "rttExcursionsIdle": 2,
+    })
+    m = db.get_device_metrics("dev1", 0)[-1]
+    assert m["rtt_samples"] == 12
+    assert m["rtt_avg_ms"] == round(1700 / 12, 1)
+    assert m["rtt_min_ms"] == 30    # best across both windows
+    assert m["rtt_max_ms"] == 1100  # worst across both windows
+    assert m["rtt_excursions"] == 2
+    assert m["rtt_excursions_idle"] == 2
+
+
+def test_window_without_rtt_samples_does_not_poison_the_minimum(fresh_db):
+    """
+    A stats report can land with no completed probe in its window. That must
+    not reset the running minimum to 0 — the same class of bug as
+    link_speed's absent-means-not-sampled.
+    """
+    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.record_device_stats("dev1", {
+        "cpuPct": 5.0, "memUsedMb": 100,
+        "rttSumMs": 120, "rttSamples": 3, "rttMinMs": 35, "rttMaxMs": 50,
+    })
+    db.record_device_stats("dev1", {"cpuPct": 5.0, "memUsedMb": 100})
+    m = db.get_device_metrics("dev1", 0)[-1]
+    assert m["rtt_min_ms"] == 35
+    assert m["rtt_max_ms"] == 50
+    assert m["rtt_samples"] == 3
+
+
+def test_driver_dead_counters_are_not_surfaced(fresh_db):
+    """
+    tx_errors/tx_dropped/rx_crc read zero on this hardware regardless of link
+    quality, so they must not appear in the read API where a zero would be
+    mistaken for health.
+    """
+    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.record_device_stats("dev1", {"cpuPct": 5.0, "memUsedMb": 100})
+    m = db.get_device_metrics("dev1", 0)[-1]
+    for dead in ("tx_errors", "tx_dropped", "rx_crc"):
+        assert dead not in m
+
+
+def test_excursion_rate_not_raw_count_is_the_discriminator(fresh_db):
+    """
+    "Every excursion happened while idle" is vacuous if almost every SAMPLE
+    is idle — which is the normal case, since devices spend most of their
+    life outside a turn. The read API must expose per-state RATES so the
+    comparison is meaningful.
+    """
+    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    # 100 samples: 90 idle with 9 excursions (10%), 10 busy with 5 (50%).
+    db.record_device_stats("dev1", {
+        "cpuPct": 5.0, "memUsedMb": 100,
+        "rttSumMs": 5000, "rttSamples": 100, "rttMinMs": 5, "rttMaxMs": 900,
+        "rttExcursions": 14, "rttExcursionsIdle": 9, "rttSamplesIdle": 90,
+    })
+    m = db.get_device_metrics("dev1", 0)[-1]
+    assert m["rtt_excursion_pct_idle"] == 10.0
+    assert m["rtt_excursion_pct_busy"] == 50.0
+
+
+def test_excursion_rates_are_none_without_samples_in_that_state(fresh_db):
+    """No busy samples must read None, not 0% — absence of data is not
+    evidence of a clean state."""
+    db.register_new_device("dev1", "10.0.0.9", "vtest")
+    db.record_device_stats("dev1", {
+        "cpuPct": 5.0, "memUsedMb": 100,
+        "rttSumMs": 500, "rttSamples": 10, "rttMinMs": 5, "rttMaxMs": 90,
+        "rttExcursions": 1, "rttExcursionsIdle": 1, "rttSamplesIdle": 10,
+    })
+    m = db.get_device_metrics("dev1", 0)[-1]
+    assert m["rtt_excursion_pct_idle"] == 10.0
+    assert m["rtt_excursion_pct_busy"] is None
+
+
+# ── v13 — on-device wake word shadow mode ────────────────────────────────────
+
+def test_migrates_to_v13(fresh_db):
+    assert int(db.get_config("schema_version")) >= 13
+
+
+def test_turns_has_shadow_columns(fresh_db):
+    cols = _cols("turns")
+    for c in ("dev_wake_score", "dev_wake_delta_ms", "dev_shadow"):
+        assert c in cols, f"turns.{c} missing"
+
+
+def test_wake_counters_has_shadow_columns(fresh_db):
+    cols = _cols("wake_counters")
+    for c in ("dev_frames", "dev_drops", "dev_crossings", "dev_max_score"):
+        assert c in cols, f"wake_counters.{c} missing"
+
+
+def test_shadow_turn_fields_round_trip(fresh_db):
+    """The v13 columns must survive insert_turn's dict→column mapping. A field
+    present in the record but absent from _TURN_COLUMNS is silently discarded,
+    which is exactly how a comparison feature ends up reporting nothing."""
+    turn_id = db.insert_turn("dev1", {
+        "ts": 1_800_000_000,
+        "trigger": "wakeword(0.71)",
+        "wake_score": 0.71,
+        "outcome": "ok",
+        "dev_wake_score": 0.63,
+        "dev_wake_delta_ms": -140,
+        "dev_shadow": 1,
+    })
+    row = db._q("SELECT * FROM turns WHERE id = ?", (turn_id,))[0]
+    assert row["dev_wake_score"] == 0.63
+    assert row["dev_wake_delta_ms"] == -140
+    assert row["dev_shadow"] == 1
+
+
+def test_shadow_counters_accumulate_and_max(fresh_db):
+    """Counters sum; the max score takes the maximum. Getting the second one
+    wrong (summing scores) produces a number that looks like a score and is
+    not — the same class of bug as the near-miss max."""
+    db.bump_wake_counters("dev2", dev_frames=100, dev_drops=2,
+                          dev_crossings=1, dev_max_score=0.4)
+    db.bump_wake_counters("dev2", dev_frames=50, dev_drops=1,
+                          dev_crossings=2, dev_max_score=0.9)
+    db.bump_wake_counters("dev2", dev_frames=25, dev_max_score=0.6)
+
+    rows = db.get_wake_counters("dev2", 0)
+    assert len(rows) == 1, "all three bumps belong to the same hour bucket"
+    r = rows[0]
+    assert r["dev_frames"] == 175
+    assert r["dev_drops"] == 3
+    assert r["dev_crossings"] == 3
+    assert r["dev_max_score"] == 0.9
+
+
+def test_shadow_counters_do_not_disturb_near_miss_columns(fresh_db):
+    """The dev_* arguments were added to an existing upsert that the wake loop
+    calls every 2s. A mistake in the ON CONFLICT list would corrupt near-miss
+    accounting, which has nothing to do with this feature."""
+    db.bump_wake_counters("dev3", near_misses=3, near_miss_max=0.44)
+    db.bump_wake_counters("dev3", dev_frames=10, dev_max_score=0.2)
+    r = db.get_wake_counters("dev3", 0)[0]
+    assert r["near_misses"] == 3
+    assert r["near_miss_max"] == 0.44
+    assert r["dev_frames"] == 10
+
+
+# ── v14 — thermals and CPU topology ──────────────────────────────────────────
+
+def test_migrates_to_v14(fresh_db):
+    assert int(db.get_config("schema_version")) >= 14
+
+
+def test_device_metrics_has_thermal_columns(fresh_db):
+    cols = _cols("device_metrics")
+    for c in ("cpu_temp_sum", "cpu_temp_samples", "cpu_temp_max", "max_temp_max",
+              "cores_online_last", "cores_online_min", "cores_total",
+              "thermal_limit_min"):
+        assert c in cols, f"device_metrics.{c} missing"
+
+
+def test_thermal_stats_relay_and_rollup(fresh_db):
+    """The relay guard: a device stat has to be named in DeviceStats (Go), the
+    em_controller allowlist AND here, or it is silently dropped. This covers
+    the third."""
+    db.record_device_stats("dev-t", {
+        "cpuPct": 25.0, "memUsedMb": 200, "cpuTempC": 33.0, "maxTempC": 34.2,
+        "coresOnline": 2, "coresTotal": 4, "thermalCoreLimit": 4,
+    })
+    db.record_device_stats("dev-t", {
+        "cpuPct": 51.0, "memUsedMb": 205, "cpuTempC": 39.0, "maxTempC": 41.0,
+        "coresOnline": 1, "coresTotal": 4, "thermalCoreLimit": 3,
+    })
+    m = db.get_device_metrics("dev-t", 0)[0]
+    assert m["cpu_temp_avg"] == 36.0, "mean of 33 and 39"
+    assert m["cpu_temp_max"] == 39.0
+    assert m["max_temp_max"] == 41.0
+    assert m["cores_online_last"] == 1
+    assert m["cores_online_min"] == 1, "the tightest the device ever ran"
+    assert m["cores_total"] == 4
+    assert m["thermal_limit_min"] == 3, "throttling happened this hour"
+
+
+def test_unreadable_temp_does_not_dilute_the_mean(fresh_db):
+    """A missing sensor reading must be skipped, not counted as 0C — averaging
+    a zero in reads as a cool device, which is the wrong direction for a metric
+    whose whole job is to warn."""
+    db.record_device_stats("dev-u", {"cpuPct": 20.0, "cpuTempC": 40.0})
+    db.record_device_stats("dev-u", {"cpuPct": 20.0})  # sensor unreadable
+    m = db.get_device_metrics("dev-u", 0)[0]
+    assert m["samples"] == 2
+    assert m["cpu_temp_avg"] == 40.0, "one temp sample, not 20.0"
+
+
+def test_metrics_without_thermals_stay_null(fresh_db):
+    """Older firmware sends no thermal fields; those must read as absent rather
+    than as a 0C device with 0 cores."""
+    db.record_device_stats("dev-old", {"cpuPct": 22.0, "memUsedMb": 180})
+    m = db.get_device_metrics("dev-old", 0)[0]
+    assert m["cpu_temp_avg"] is None
+    assert m["cores_online_last"] is None
+    assert m["thermal_limit_min"] is None
+
+
+# ── v15 — the device's own threshold, per turn ────────────────────────────────
+
+def test_migrates_to_v15(fresh_db):
+    assert int(db.get_config("schema_version")) >= 15
+
+
+def test_turns_has_dev_threshold(fresh_db):
+    assert "dev_threshold" in _cols("turns")
+
+
+def test_barge_in_turn_records_the_threshold_it_actually_cleared(fresh_db):
+    """
+    A wake that fires during playback clears bargeInThreshold, not owwThreshold.
+    Recording the nominal 0.5 produced rows that contradicted themselves —
+    wake_score 0.055 against wake_threshold 0.5, i.e. "woke below its own bar" —
+    and left the on-device comparison unable to tell a real miss from a question
+    the device was never asked.
+    """
+    turn_id = db.insert_turn("dev-b", {
+        "ts": 1_800_000_100,
+        "trigger": "wakeword(0.055)",
+        "wake_score": 0.055,
+        "wake_threshold": 0.05,   # the barge bar it cleared, not the nominal 0.5
+        "dev_shadow": 1,
+        "dev_threshold": 0.5,     # what the device was scoring against
+        "dev_wake_score": None,   # so it did not cross — but fairly so
+        "outcome": "ok",
+    })
+    r = db._q("SELECT * FROM turns WHERE id = ?", (turn_id,))[0]
+    assert r["wake_score"] >= r["wake_threshold"], \
+        "a turn must not record a score below the threshold it cleared"
+    assert r["dev_threshold"] == 0.5
+    # The comparison logic in em_api treats this as NOT comparable, because the
+    # controller's bar (0.10) is below the device's (0.5).
+    assert r["wake_threshold"] < r["dev_threshold"]

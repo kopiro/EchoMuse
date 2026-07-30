@@ -7,9 +7,27 @@ language.
 
 - **Fleet config** (gear icon → Fleet Config): the defaults every device
   uses.
-- **Per-device config** (device page → Config tab): flip the override toggle
-  and that device gets its own copy of the settings, ignoring fleet changes
-  until you flip it back.
+- **Per-device config** (device page → Config tab): each section carries its
+  own **Fleet / Device** switch in its header.
+
+Scoping is **per section**, not all-or-nothing. Leave a section on *Fleet*
+and it keeps following the fleet-wide value, including future changes. Flip
+it to *Device* and only that section becomes this device's own — everything
+else carries on tracking the fleet.
+
+So a Dot in a small room can have its own **Ring** scene and its own
+**Microphones** gain while still picking up every fleet change to the wake
+word, EQ and Bluetooth settings. Before this, one override forked *all* the
+settings and froze them against fleet changes permanently.
+
+A section showing *Fleet* is displayed read-only rather than hidden, so you
+can always see what it is inheriting. The banner at the top of the tab
+summarises — `Fleet`, or `Local override (2 of 6)` with the sections named —
+and **Revert all to fleet** puts everything back.
+
+Flipping a section back to *Fleet* **discards** the values it was holding.
+There is no hidden shadow copy waiting to reappear if you flip it to *Device*
+again months later; it starts from the fleet value.
 
 Changes apply **immediately** — no restarts, no rebuilds. The Config tab
 opens with the device's **network (WiFi)** settings at the top — always
@@ -18,10 +36,27 @@ fleet-inheritable sections, in order of how often you'll realistically touch
 them: **Playback**, **Wake word**, **Microphones**, **Ring**, **Advanced**,
 **Bluetooth**.
 
+The **CPU** meter shows the core count beside the percentage — "27% · 2/4
+cores". The Dot has four CPU cores and parks the ones it isn't using, and the
+percentage is a share of the cores that are *awake*, so the same amount of
+work reads as a bigger number when fewer are. Without the core count beside
+it the figure can appear to halve when nothing actually changed.
+
 Two other device tabs worth knowing: **Status** (IP, firmware, WiFi network,
-ESPHome port, resource meters, and the Bluetooth-proxy diagnostics panel when
-enabled) and **Activity** (voice-turn history — what was heard, how it was
-transcribed, wake-word scores, playback underruns, near-misses). Activity
+ESPHome port, current volume, whether the config is fleet or overridden,
+resource meters including **Latency** (the round trip to the device — amber
+past 200ms, red past 1s; the only link-health signal the Echo's WiFi driver
+actually provides, since it reports no retry or noise figures) and **Temp**
+(the Dot's CPU sensor, and the hottest of its eleven sensors when that's
+meaningfully warmer; it idles around 33°C, so anything amber is genuinely
+unusual — and if the chip's thermal governor ever starts capping CPU
+capacity, this is where it says so), and the
+Bluetooth-proxy diagnostics panel when enabled —
+the Status row reads `Online`, or `Offline` with how long ago the device was
+last heard from) and **Activity** (voice-turn history — what was heard, how it was
+transcribed, wake-word scores, playback underruns, near-misses, and — if
+**Save utterances** is on — the recorded audio of each turn, playable and
+downloadable). Activity
 history is stored in the controller's database, so it survives controller
 and device restarts; hourly hardware trends (CPU, memory, WiFi signal) are
 kept for 180 days and available via the API
@@ -47,14 +82,23 @@ little speaker is boomy and dull by default.
 An extra presence bump for spoken responses. Try it if responses sound
 muffled from across the room.
 
-### Startup volume
-The volume the device comes back with after a reboot or power cut. Since
-v2.9.4 this **tracks the volume you actually use**: every change you make —
+### Volume
+Volume **tracks what you actually use** and survives reboots: every change —
 buttons, Home Assistant slider, wherever — is remembered by the controller
-and restored when the device reconnects after a restart. Set it low in the
-evening and a midnight power blip brings it back low. The slider here is
-the stored restore point; it updates itself as you change volume, so you
-rarely need to touch it.
+and restored when the device reconnects. Set it low in the evening and a
+midnight power blip brings it back low.
+
+There is no volume slider in this section. There used to be, and it was
+misleading: the device only re-applies the stored level on the first config
+push after it boots, so moving the slider did nothing until the device
+restarted — and any real volume change overwrote it in the meantime. Volume
+is remembered device state rather than a setting you dial in, so the current
+level is now shown read-only on the **Status** tab. Change it from Home
+Assistant or the device buttons.
+
+It is also never inherited from the fleet, whatever the section's Fleet /
+Device switch says — otherwise a device would come back at another room's
+volume.
 
 Mute is remembered too, but by the device itself: a muted Dot stays muted
 through reboots, power cuts, and firmware updates — red ring and all —
@@ -64,8 +108,10 @@ whether or not the controller is reachable.
 
 ## 02 — Wake word
 
-How the device decides you said the magic word. (This work actually happens
-on the controller, not the Dot — the Dot just streams audio to it.)
+How the device decides you said the magic word. By default this work happens
+on the controller, not the Dot — the Dot just streams audio to it. (The Dot
+*can* now also score locally, but only as a shadow comparison that changes
+nothing about behaviour — see **Score on device** below.)
 
 ### Wake word model
 Which word wakes it: Hey Jarvis, Alexa, Hey Mycroft, or Hey Rhasspy. These
@@ -81,12 +127,21 @@ deletes it.
 
 ### Arbitration window
 With more than one Echo, saying the wake word in earshot of two of them
-used to start two competing conversations. Now detections landing within
-this window (default 300ms) are pooled and only the device that heard you
-best — loudest relative to its own room's background noise — answers; the
-others quietly stand down. The cost is that every wake waits out the
-window before responding, so don't crank it; 0 disables, and it never
-applies when only one device is online.
+used to start two competing conversations. Now the **first device to hear
+you answers immediately**, and any other device detecting the same word
+within this window (default 700ms) quietly stands down.
+
+There is **no latency cost**: the winner claims the turn on the spot rather
+than waiting out the window, so a solo wake is exactly as fast as it was
+before. The window only decides how long afterwards a second device counts
+as "the same utterance". `0` disables it, and it never applies when only
+one device is online.
+
+An earlier version instead waited out the window and gave the turn to
+whichever device heard you *best*. That was dropped: it taxed every wake by
+~364ms even when nothing was competing, and field data showed the
+signal-to-noise winner produced a *worse* transcript than the device that
+simply heard you first.
 
 ### Sensitivity (Precise ↔ Eager)
 The confidence bar the recogniser must clear.
@@ -122,6 +177,33 @@ Runs a noise cleaner on the audio *only for wake-word scoring* (your actual
 commands are untouched). Worth trying in rooms with constant background
 noise (TV, air-con) if wake detection is unreliable there. Off by default —
 it's a "try it and compare" option.
+
+### Score on device (shadow)
+Experimental, off by default, and **changes nothing about how the Dot
+behaves**. With it on, the Echo runs the same wake-word model over the same
+audio and reports what it *would* have detected. It never triggers a turn.
+
+The point is to find out whether on-device detection is trustworthy before
+anything depends on it. Each voice turn's row in **Activity** gains the
+device's own score next to the controller's, and the per-device activity API
+returns an agreement summary (how often they agreed, how far apart in
+milliseconds, and crossings the device saw that never became a turn).
+
+Three things to know before turning it on:
+
+- **It needs files installed on the Dot** that aren't part of the firmware —
+  ONNX Runtime plus the wake-word models, about 15MB, placed in
+  `/data/local/share/echomuse/oww`. They're deliberately not shipped in the
+  firmware image, because that would double both the download and the space
+  each of the two firmware slots takes. Until they're there, the toggle does
+  nothing and the device log says which file is missing.
+- **It costs about half a CPU core, permanently**, because the wake stream is
+  always on. Measured on an Echo Dot Gen 2 that has capacity for it — the mic
+  pipeline was unaffected across hours of use, including during music
+  playback — but enable it on **one device at a time** and watch the
+  **Resources** panel on the Status tab.
+- **It needs recent firmware.** The toggle is disabled and says so on Echos
+  whose firmware predates the feature, rather than appearing to work.
 
 ---
 
@@ -183,6 +265,40 @@ tuning knobs:
 - **AEC tail** — how much room echo/reverberation the canceller models.
   Default 300ms; raise toward 500 in big empty-sounding rooms.
 
+**Save utterances** — keeps the audio of recent voice turns so you can
+*listen* to what was sent for transcription. The **Activity** tab then shows
+a ▶ (play here) and a ⤓ (download the WAV) on every turn that has a
+recording.
+
+What's saved is the audio **exactly as speech-to-text received it** — so if
+**Noise suppression** is on, you're hearing the cleaned-up version, not the
+raw microphone. That's deliberate: when a transcript comes back wrong, the
+only recording that can explain it is the one the recogniser actually heard.
+
+This is the honest way to answer "is my microphone any good?". Without it
+you're guessing from a garbled transcript, which can't tell you whether the
+room was noisy, the gain was too low, or the denoiser chewed a word. Thirty
+seconds of listening usually settles it — and it's the only sensible way to
+A/B **Mic gain**, the pickup presets, or **Noise suppression**, since you can
+compare the same phrase before and after.
+
+**Off by default, and worth thinking about before switching on.** This is the
+only setting that stores recognisable speech on the controller. What's kept:
+the **last 10 turns per device**, as plain WAV files in the controller's data
+folder, each overwritten as newer ones arrive. Only the audio sent for
+recognition is saved — never the always-on wake-word listening, which is
+discarded continuously and never written anywhere.
+
+Turning the setting back off stops new recordings immediately, but **leaves
+the ones already saved where they are** — deliberately, so that switching off
+doesn't destroy samples you were part-way through comparing. They stay until
+newer recordings push them out (which needs the setting back on) or you
+delete the device, which removes its recordings too. To clear them out sooner,
+delete the files from the controller's `data/recordings/` folder.
+
+A turn recorded a while ago may show no buttons — that just means its
+recording has aged past the last 10 and the turn history has outlived it.
+
 ---
 
 ## 04 — Ring
@@ -209,6 +325,43 @@ means the microphones are off — it's a privacy indicator, not decoration)
 and the cyan volume arc. The directional "which mic is listening" highlight
 also adapts automatically: it brightens the scene's ring colour rather than
 painting green.
+
+The volume arc holds the ring for about two seconds so a turn animation
+can't wipe it the instant it appears — but **pressing the action button
+cancels it immediately**, so adjusting the volume and then talking to the
+device still shows you the listening ring straight away.
+
+### How a turn ends
+The ring tells you *why* a conversation stopped, using rhythm rather than
+colour (red, orange and cyan already mean mute, no-controller and volume):
+
+- **One slow throb** — the device was listening and heard nothing.
+- **A few quick blinks** — something went wrong (Home Assistant errored, or
+  no speech came back).
+- **Ring simply goes out** — normal end, or you cancelled it yourself.
+
+The ring also now clears when the audio *actually* finishes, rather than
+when the controller estimates it should have. On a slow WiFi link the old
+estimate could clear the ring several seconds before the Dot had stopped
+talking.
+
+### Meter response (Advanced)
+While a response plays the ring throbs with the live speaker level. The
+**Advanced** panel here shapes how hard it throbs — the device renders it
+locally, so changes apply on the next response with no restart:
+
+- **Decay** — how fast it falls. Higher tracks individual syllables; lower
+  reads as a slow swell.
+- **Attack** — how fast it rises on a peak.
+- **Gamma** — contrast. Higher makes the swing more visible.
+- **Floor** — brightness during silence. `0` goes fully dark between words.
+- **Reference** — the speaker level mapped to full brightness. Lower is more
+  sensitive.
+- **Curve** — below `1` lifts quiet consonants into view.
+
+These are taste settings, which is exactly why they're adjustable here
+rather than baked into firmware. The defaults are tuned for speech; if the
+ring looks too static, raise **Decay** and **Gamma** first.
 
 ## 05 — Advanced
 

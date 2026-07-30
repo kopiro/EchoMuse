@@ -36,6 +36,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3 as _sqlite3
 import tempfile
 import time
@@ -49,8 +50,10 @@ import websockets
 import em_db as db
 import em_auth as auth
 import em_ble_proxy
+import em_config_sections as sections_mod
 import em_oww_models
 import em_pki
+import em_recordings
 import em_scenes
 from version import VERSION as CONTROLLER_VERSION
 
@@ -209,6 +212,7 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/devices/{id}/logs",          _get_device_logs)
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
+    app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
@@ -243,6 +247,7 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/provision/latest_binary", _get_provision_latest_binary)
     app.router.add_post("/api/provision/tls_credentials", _post_provision_tls_credentials)
     app.router.add_post("/api/devices/{id}/secure_link",  _post_secure_link)
+    app.router.add_post("/api/devices/{id}/debloat",      _post_debloat)
 
     # Live events WebSocket
     app.router.add_get("/api/events", _ws_events)
@@ -293,11 +298,38 @@ async def _serve_spa(request: web.Request) -> web.Response:
 
 
 async def _serve_dashboard(request: web.Request) -> web.Response:
-    """Serve dashboard.html for /dashboard."""
+    """
+    Serve dashboard.html for /dashboard, with the JS bundle cache-busted.
+
+    add_static sends Last-Modified and ETag but no Cache-Control, so browsers
+    apply HEURISTIC freshness and serve a cached dashboard.js without
+    revalidating. The failure mode is nasty because it is invisible from the
+    server side: the deploy is correct, the file on disk is correct, the
+    compiled bundle is correct, and the browser shows the previous UI — which
+    reads as "my change did not work" and sends you looking in the wrong place.
+    It cost exactly that on 2026-07-30 when the new thermal row did not appear.
+
+    So the bundle URL carries the file's mtime. That changes on every rebuild
+    regardless of version numbering (controller_version is "dev" for local
+    builds and would not bust between two dev deploys), and the wrapper itself
+    is sent no-cache so the new URL is always seen — it is 3KB, revalidating it
+    costs nothing.
+    """
     dashboard = STATIC_DIR / "dashboard.html"
     if not dashboard.exists():
         return web.Response(status=503, text="dashboard.html not found in static/")
-    return web.FileResponse(dashboard)
+    html = dashboard.read_text(encoding="utf-8")
+    bundle = STATIC_DIR / "dashboard.js"
+    if bundle.exists():
+        html = html.replace(
+            "/static/dashboard.js",
+            f"/static/dashboard.js?v={int(bundle.stat().st_mtime)}",
+        )
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 async def _redirect_root(request: web.Request) -> web.Response:
@@ -410,6 +442,57 @@ async def _get_device_turns(request: web.Request) -> web.Response:
 
 
 @auth.require_auth
+async def _get_turn_audio(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/turns/{turn}/audio — the saved mic audio for
+    one voice turn, as a downloadable WAV.
+
+    Only turns captured while saveUtterances was on have one, and only the
+    newest em_recordings.KEEP_PER_DEVICE per device survive — a turn row
+    older than that window still carries the filename but the file is gone,
+    so a 404 here is an ordinary outcome, not an error state.
+
+    The filename is derived from (device, turn) rather than taken from the
+    row: em_recordings.resolve then re-checks that the file belongs to the
+    device in the URL, so a turn id from another device can't be used to
+    reach its audio."""
+    device_id = request.match_info["id"]
+    try:
+        turn_id = int(request.match_info["turn"])
+    except ValueError:
+        return _error("bad_request", "turn must be an integer", 400)
+
+    loop = asyncio.get_event_loop()
+    row  = await loop.run_in_executor(None, db.get_device, device_id)
+    if row is None:
+        return _error("device_not_found", f"No device: {device_id}", 404)
+
+    name = em_recordings.filename(device_id, turn_id)
+    path = em_recordings.resolve(device_id, name) if name else None
+    if path is None:
+        return _error("no_recording",
+                      "No saved audio for this turn", 404)
+
+    label = _slug(row["label"] or device_id)
+    return web.FileResponse(
+        path,
+        headers={
+            "Content-Type":        "audio/wav",
+            "Content-Disposition": f'attachment; filename="{label}-turn{turn_id}.wav"',
+            # Recordings are immutable once written and their names are
+            # unique per turn, but the retention window means a name can
+            # stop resolving — so cache privately and briefly, never shared.
+            "Cache-Control":       "private, max-age=60",
+        },
+    )
+
+
+def _slug(text: str) -> str:
+    """Lowercase ASCII slug, safe for a Content-Disposition filename."""
+    out = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
+    return out or "device"
+
+
+@auth.require_auth
 async def _get_device_activity(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/activity?days=7 — aggregated activity stats
     for trend review: per-day turn buckets (counts, outcomes, latency
@@ -490,11 +573,72 @@ async def _get_device_activity(request: web.Request) -> web.Response:
         for name, m in models.items()
     }
 
+    # On-device shadow comparison (schema v13) — the verdict, computed here so
+    # a reader is not left to derive it from raw columns.
+    #
+    # Denominator is turns where the device was KNOWN to be scoring
+    # (dev_shadow=1); a NULL score on those is a genuine miss, whereas a NULL
+    # anywhere else is absence of data and must not be counted either way.
+    scoring    = [t for t in turns if (t["dev_shadow"] or 0) == 1]
+    # A turn is only COMPARABLE if the device was scoring against a bar this
+    # controller's wake would have cleared. During playback the controller drops
+    # to bargeInThreshold, so a turn that fired at 0.055 was never something a
+    # device scoring against 0.5 could have caught — counting those as misses
+    # made the agreement figure pessimistic, which is how this was found.
+    # A device that reports no threshold (older firmware) is also not comparable:
+    # unknown, rather than guessed at.
+    def _comparable(t) -> bool:
+        dev_thr = t["dev_threshold"]
+        if dev_thr is None:
+            return False
+        wake_thr = t["wake_threshold"]
+        return wake_thr is not None and wake_thr >= dev_thr
+
+    compared   = [t for t in scoring if _comparable(t)]
+    incomparable = len(scoring) - len(compared)
+    agreed     = [t for t in compared if t["dev_wake_score"] is not None]
+    deltas     = sorted(t["dev_wake_delta_ms"] for t in agreed
+                        if t["dev_wake_delta_ms"] is not None)
+    dev_scores = [t["dev_wake_score"] for t in agreed]
+    crossings  = sum(r["dev_crossings"] or 0 for r in counters)
+    shadow_out = {
+        "turns_scoring":  len(scoring),
+        "turns_compared": len(compared),
+        # Turns where the device was scoring but the comparison is not valid —
+        # the controller used a lower (barge-in) bar, or the device's threshold
+        # is unknown. Reported rather than hidden: a large number here means the
+        # agreement figure is describing a small slice of reality.
+        "not_comparable": incomparable,
+        "agreed":         len(agreed),
+        "missed":         len(compared) - len(agreed),
+        "agreement_pct":  round(100.0 * len(agreed) / len(compared), 1) if compared else None,
+        # Signed: negative means the device crossed FIRST, which is the
+        # expected direction — it scores the frame it just captured while the
+        # controller scores the same frame after a network hop.
+        "delta_ms_p50":   pct(deltas, 0.50),
+        "delta_ms_p95":   pct(deltas, 0.95),
+        "dev_score_avg":  round(sum(dev_scores) / len(dev_scores), 3) if dev_scores else None,
+        "dev_score_min":  round(min(dev_scores), 3) if dev_scores else None,
+        "crossings":      crossings,
+        # Crossings that never matched a turn. This is the false-accept side of
+        # the comparison, which per-turn rows structurally cannot show — but it
+        # is an ESTIMATE, not a count: the hourly counters and the turn rows are
+        # pruned on different schedules (WAKE_COUNTER_RETENTION_DAYS vs
+        # TURN_RETENTION rows), so over a long window this drifts. Treat a
+        # small number as noise and a large one as worth investigating.
+        "unmatched_crossings": max(0, crossings - len(agreed)),
+        "frames":         sum(r["dev_frames"] or 0 for r in counters),
+        # Nonzero drops mean the device could not keep up, so every figure
+        # above is describing a subset of the audio.
+        "drops":          sum(r["dev_drops"] or 0 for r in counters),
+    }
+
     return _ok({
         "days":          days_out,
         "wake_models":   models_out,
         "wake_counters": [dict(r) for r in counters],
         "metrics":       metrics,
+        "shadow":        shadow_out,
     })
 
 
@@ -560,16 +704,62 @@ async def _post_approve(request: web.Request) -> web.Response:
     return _ok({"device_id": device_id, "label": label})
 
 
+async def _apply_live_config(device_id: str, live, effective: dict) -> None:
+    """
+    Push an effective config to a connected device and refresh the
+    controller-side mirrors of it.
+
+    Extracted because the per-device and fleet endpoints both did this
+    inline, and a mirror added to one but not the other is a bug that reads
+    as working — the same shape as the v7 stats-relay miss (PR #23). Take
+    the EFFECTIVE config, never a request body: with per-section scoping a
+    body is partial by design, and a device must always be sent the whole
+    resolved picture.
+    """
+    await live.send_control({"type": "config", **effective})
+    if "owwThreshold" in effective:
+        live.oww_threshold = float(effective["owwThreshold"])
+    if "owwModel" in effective:
+        live.oww_model = effective["owwModel"]
+        # Refresh HA's wake-word dropdown (lazy import — em_esphome imports
+        # em_api at module level).
+        import em_esphome
+        em_esphome.update_oww_model(device_id, effective["owwModel"])
+    if "owwSpeexNs" in effective:
+        live.oww_speex_ns = bool(effective["owwSpeexNs"])
+    if "nsAsr" in effective:
+        live.ns_asr = bool(effective["nsAsr"])
+    if "saveUtterances" in effective:
+        live.save_utterances = bool(effective["saveUtterances"])
+    if "bargeInEnabled" in effective:
+        live.barge_in_enabled = bool(effective["bargeInEnabled"])
+    if "bargeInThreshold" in effective:
+        live.barge_threshold = float(effective["bargeInThreshold"])
+    if "wakeArbitrationMs" in effective:
+        live.wake_arb_ms = int(effective["wakeArbitrationMs"])
+    if "eqBands" in effective:
+        live.eq_bands = effective["eqBands"]
+    if "eqLoudness" in effective:
+        live.eq_loudness = bool(effective["eqLoudness"])
+    live.led_scene = em_scenes.resolve(effective)
+
+
 @auth.require_auth
 async def _get_device_config(request: web.Request) -> web.Response:
-    """GET /api/devices/{id}/config — returns effective config and override flag."""
+    """GET /api/devices/{id}/config — effective config, scoping, and fleet view."""
     device_id = request.match_info["id"]
     loop = asyncio.get_event_loop()
     row = await loop.run_in_executor(None, db.get_device, device_id)
     if row is None:
         return _error("device_not_found", f"No device: {device_id}", 404)
     config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
-    return _ok({"config": config, "use_global_config": bool(row["use_global_config"])})
+    sections = await loop.run_in_executor(None, db.get_device_config_sections, device_id)
+    return _ok({
+        "config":            config,
+        "config_sections":   sections,
+        # Compat view for older readers: no overridden sections == fleet.
+        "use_global_config": not sections,
+    })
 
 
 @auth.require_admin
@@ -577,20 +767,21 @@ async def _post_device_config(request: web.Request) -> web.Response:
     """
     POST /api/devices/{id}/config
 
-    Body may include use_global_config (bool) and any config fields.
+    Body may include config_sections (list of section ids this device
+    overrides), any config fields, and — for older clients —
+    use_global_config (bool).
 
-    If use_global_config=true: revert device to fleet defaults. The config
-    fields in the body are ignored — the effective config is the global one.
+    Scoping is per section (see em_config_sections). Values supplied for a
+    section the device does not override are ignored: the device follows the
+    fleet there, and storing shadow values would silently resurrect them if
+    the section were ever switched back.
 
-    If use_global_config=false: enable per-device override. Config fields
-    in the body are persisted as the device's own config and pushed live.
-    If the device was previously on global, set_device_use_global(False)
-    is called first, which marks the flag without touching the config
-    column — the supplied config is then written over it.
+    use_global_config is accepted as a compat alias: true == override
+    nothing, false == override everything. That is exactly what the boolean
+    meant before v8.
 
-    If use_global_config is absent: behave as before (update config only,
-    leave the flag unchanged). This path is used by the global config push
-    to all on-global devices — it should not alter per-device flag state.
+    If neither key is present the device's current scoping is left alone and
+    only the in-scope values are updated.
     """
     device_id = request.match_info["id"]
     body = await _json_body(request)
@@ -600,88 +791,89 @@ async def _post_device_config(request: web.Request) -> web.Response:
     if row is None:
         return _error("device_not_found", f"No device: {device_id}", 404)
 
-    use_global = body.pop("use_global_config", None)  # extract flag, not a config key
-    explicit_replace = bool(body.pop("replace", False))
+    sections_body     = body.pop("config_sections", None)
+    use_global        = body.pop("use_global_config", None)
+    explicit_replace  = bool(body.pop("replace", False))
 
-    # Same replace-not-merge trap as the global endpoint (see _dropped_keys).
-    # Only checked on the paths that actually persist the body; reverting to
-    # global deliberately discards it.
-    if use_global is not True:
-        stored = await loop.run_in_executor(
-            None, db.get_device_config, device_id
+    # Compat: map the old boolean onto the section model.
+    if sections_body is None and use_global is not None:
+        sections_body = [] if use_global else list(sections_mod.SECTION_IDS)
+
+    if sections_body is None:
+        new_sections = await loop.run_in_executor(
+            None, db.get_device_config_sections, device_id
         )
-        dropped = _dropped_keys(body, stored)
-        if dropped and not explicit_replace:
-            return _error(
-                "would_drop_keys",
-                f"This body would delete {len(dropped)} existing setting(s): "
-                f"{', '.join(dropped)}. Config POSTs replace rather than "
-                f"merge — send the full config (read-modify-write), or pass "
-                f"replace=true if the deletion is intended.",
-                409,
-            )
-
-    if use_global is True:
-        # Revert to global: reset flag + config column, ignore body
-        await loop.run_in_executor(None, db.set_device_use_global, device_id, True)
-        config = await loop.run_in_executor(None, db.get_effective_device_config, device_id)
-    elif use_global is False:
-        # Enable per-device override: mark flag, then write supplied config
-        await loop.run_in_executor(None, db.set_device_use_global, device_id, False)
-        config = body
-        await loop.run_in_executor(None, db.set_device_config, device_id, config)
     else:
-        # No flag in body — plain config update, flag unchanged
-        config = body
-        await loop.run_in_executor(None, db.set_device_config, device_id, config)
+        if not isinstance(sections_body, list):
+            return _error("bad_request", "config_sections must be a list", 400)
+        unknown = [s for s in sections_body if s not in sections_mod.SECTIONS]
+        if unknown:
+            return _error(
+                "bad_request",
+                f"Unknown config section(s): {', '.join(map(str, unknown))}. "
+                f"Valid: {', '.join(sections_mod.SECTION_IDS)}.",
+                400,
+            )
+        new_sections = sections_mod.normalise(sections_body)
 
-    # Push effective config to live device if connected
+    in_scope = sections_mod.keys_for(new_sections) | sections_mod.STATE_KEYS
+
+    # Same replace-not-merge trap as the global endpoint (see _dropped_keys),
+    # but scoped: only keys that REMAIN in scope can be accidentally dropped.
+    # Keys leaving scope are being deliberately handed back to the fleet, and
+    # flagging those would make every legitimate un-override a 409.
+    stored = await loop.run_in_executor(None, db.get_device_config, device_id)
+    stored_in_scope = {k: v for k, v in stored.items() if k in in_scope}
+    dropped = _dropped_keys(body, stored_in_scope)
+    if dropped and not explicit_replace:
+        return _error(
+            "would_drop_keys",
+            f"This body would delete {len(dropped)} existing setting(s): "
+            f"{', '.join(dropped)}. Config POSTs replace rather than "
+            f"merge — send the full config (read-modify-write), or pass "
+            f"replace=true if the deletion is intended.",
+            409,
+        )
+
+    # Apply scoping first: set_device_config_sections prunes the values of
+    # any section no longer overridden, so what follows writes into an
+    # already-clean picture.
+    if sections_body is not None:
+        await loop.run_in_executor(
+            None, db.set_device_config_sections, device_id, new_sections
+        )
+    values = {k: v for k, v in body.items() if k in in_scope}
+    if values:
+        current = await loop.run_in_executor(None, db.get_device_config, device_id)
+        await loop.run_in_executor(
+            None, db.set_device_config, device_id, {**current, **values}
+        )
+
+    config = await loop.run_in_executor(
+        None, db.get_effective_device_config, device_id
+    )
+
+    # Push the EFFECTIVE config — with per-section scoping the body is
+    # partial by design, so the device must be sent the resolved picture.
     pushed = False
     live = _devices.get(device_id)
     if live is not None:
-        await live.send_control({"type": "config", **config})
-        if "owwThreshold" in config:
-            live.oww_threshold = float(config["owwThreshold"])
-        if "owwModel" in config:
-            live.oww_model = config["owwModel"]
-            # Refresh HA's wake-word dropdown (lazy import — em_esphome
-            # imports em_api at module level).
-            import em_esphome
-            em_esphome.update_oww_model(device_id, config["owwModel"])
-        if "owwSpeexNs" in config:
-            live.oww_speex_ns = bool(config["owwSpeexNs"])
-        if "nsAsr" in config:
-            live.ns_asr = bool(config["nsAsr"])
-        if "bargeInEnabled" in config:
-            live.barge_in_enabled = bool(config["bargeInEnabled"])
-        if "bargeInThreshold" in config:
-            live.barge_threshold = float(config["bargeInThreshold"])
-        if "wakeArbitrationMs" in config:
-            live.wake_arb_ms = int(config["wakeArbitrationMs"])
-        if "eqBands" in config:
-            live.eq_bands = config["eqBands"]
-        if "eqLoudness" in config:
-            live.eq_loudness = bool(config["eqLoudness"])
-        if any(k in config for k in ("ledScene", "ledListenColor", "ledThinkColor")):
-            # Scene resolution needs the full config (custom colours may not
-            # be in a partial body) — re-read the effective config.
-            eff = await loop.run_in_executor(
-                None, db.get_effective_device_config, device_id
-            )
-            live.led_scene = em_scenes.resolve(eff)
+        await _apply_live_config(device_id, live, config)
         log.info(f"[api] Config pushed to live device: {device_id}")
         pushed = True
 
     # BT proxy lifecycle follows bleProxyEnabled in the *effective* config —
-    # reconcile unconditionally (idempotent): a revert-to-global changes the
+    # reconcile unconditionally (idempotent): re-scoping a section changes the
     # effective value without the key appearing in the body.
     await em_ble_proxy.reconcile(device_id)
 
-    effective_use_global = use_global if use_global is not None else bool(row["use_global_config"])
     await _push_event({"type": "device_update", "device_id": device_id,
-                       "state": {"config": config, "use_global_config": effective_use_global}})
+                       "state": {"config": config,
+                                 "config_sections": new_sections,
+                                 "use_global_config": not new_sections}})
     return _ok({"device_id": device_id, "config": config,
-                "use_global_config": effective_use_global, "pushed": pushed})
+                "config_sections": new_sections,
+                "use_global_config": not new_sections, "pushed": pushed})
 
 
 @auth.require_admin
@@ -1138,6 +1330,9 @@ async def _run_update(device_id: str, release: dict,
         # Sync the startup script while we're here — OTA is the only update
         # path existing devices have for it (see _sync_start_script).
         await _sync_start_script(live, device_id)
+        # Payload drift is not limited to the start script — the debloat
+        # halves had no update path at all until 2026-07-30.
+        await _sync_debloat(live, device_id)
 
         inactive_slot = "server_b" if active_slot == "server_a" else "server_a"
         await _push_log_event(device_id, "info", "controller",
@@ -1583,6 +1778,156 @@ async def _sync_start_script(live, device_id: str) -> None:
     await asyncio.sleep(1.0)
 
 
+# Magisk service.d location of the boot-time debloat script. Installed by the
+# provisioning wizard; synced from here afterwards.
+DEBLOAT_SCRIPT_PATH = "/sbin/.core/img/.core/service.d/echomuse-debloat.sh"
+
+
+def _debloat_packages() -> list[str]:
+    """The pm-hide list from the canonical payload, comments stripped."""
+    try:
+        raw = (PAYLOADS_DIR / "debloat_packages.txt").read_text()
+    except OSError as e:
+        log.error(f"[api] debloat_packages.txt unreadable: {e}")
+        return []
+    return [ln.strip() for ln in raw.splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+async def _sync_debloat(live, device_id: str) -> None:
+    """
+    Heal debloat drift on a device that is already in the field.
+
+    The debloat has two halves and neither had an update path. The boot script
+    was installed once by the provisioning wizard, and the pm-hide list was
+    applied once at the same time — so a device provisioned before a list grew
+    never receives the addition. Found 2026-07-30 when round 2 added
+    com.amazon.whad and every existing device needed a manual push.
+
+    Both halves are reconciled here, idempotently, so this is safe to run as
+    often as you like:
+
+      * the script by md5 against the canonical payload, replaced by rename so
+        the running shell keeps reading the old inode (same reasoning as
+        _sync_start_script — it takes effect on the next device reboot);
+      * the hide list by asking the device which of those packages are still
+        VISIBLE and hiding only those. One `pm list packages` costs about a
+        second; `pm hide` is slow enough per call that hiding all 32
+        unconditionally would add half a minute for nothing.
+
+    Best-effort throughout: a failure logs and returns, and never blocks the
+    firmware update this normally rides along with.
+
+    Note what hiding does NOT do: com.amazon.whad is PERSISTENT, so hiding it
+    leaves the running instance alive until the next reboot (am force-stop is a
+    no-op on it — measured). That matches the rest of the debloat's semantics
+    rather than being a shortcoming of this function, and it is why the log
+    line says "next reboot".
+    """
+    # ── half 1: the boot script ──────────────────────────────────────────────
+    try:
+        script = (PAYLOADS_DIR / "echomuse-debloat.sh").read_bytes()
+    except OSError as e:
+        log.error(f"[api] echomuse-debloat.sh payload unreadable — skipping sync: {e}")
+        script = None
+
+    if script is not None:
+        want = hashlib.md5(script).hexdigest()
+        out = await _shell_run(live, f"busybox md5sum {DEBLOAT_SCRIPT_PATH} 2>/dev/null")
+        if want not in out:
+            # An empty result also lands here — a device provisioned before the
+            # script existed has no file at all, and installing it is right.
+            await asyncio.sleep(1.0)
+            await _push_log_event(device_id, "info", "controller",
+                                  "debloat script out of date — syncing canonical version")
+            tmp = DEBLOAT_SCRIPT_PATH + ".new"
+            if await _stream_file_to_device(live, script, tmp):
+                await asyncio.sleep(1.0)
+                res = await _shell_run(live,
+                    f'NEW=$(busybox md5sum {tmp} | busybox cut -d" " -f1); '
+                    f'if [ "$NEW" = "{want}" ]; then '
+                    f'mv {tmp} {DEBLOAT_SCRIPT_PATH} && chmod 755 {DEBLOAT_SCRIPT_PATH} '
+                    f'&& echo DEBLOAT_SYNCED; '
+                    f'else rm -f {tmp}; echo DEBLOAT_MD5_MISMATCH:$NEW; fi')
+                await _push_log_event(
+                    device_id,
+                    "info" if "DEBLOAT_SYNCED" in res else "warn", "controller",
+                    "debloat script synced — daemon stops take effect on next device reboot"
+                    if "DEBLOAT_SYNCED" in res else
+                    f"debloat script sync failed ({res.strip() or 'no output'})")
+            else:
+                await _push_log_event(device_id, "warn", "controller",
+                                      "debloat script sync failed (transfer)")
+            await asyncio.sleep(1.0)
+
+    # ── half 2: the pm-hide list ─────────────────────────────────────────────
+    pkgs = _debloat_packages()
+    if not pkgs:
+        return
+    # Built as a file rather than a long inline list: 30-odd package names is
+    # over a kilobyte of command line, and a shell command that is *usually*
+    # short enough is the kind of thing that breaks on the day someone adds the
+    # thirty-third package.
+    listing = ("\n".join(pkgs) + "\n").encode()
+    remote_list = "/data/local/tmp/em_debloat_pkgs.txt"
+    if not await _stream_file_to_device(live, listing, remote_list, mode="644"):
+        await _push_log_event(device_id, "warn", "controller",
+                              "debloat hide-list sync failed (transfer)")
+        return
+    await asyncio.sleep(1.0)
+
+    # Two details here were learned by getting them wrong (2026-07-30).
+    #
+    # The list is iterated with `for` over a variable, NOT `while read < file`:
+    # `pm` is a wrapper that starts app_process, and a command inside a read
+    # loop can consume the loop's own stdin, silently ending it early. `pm hide`
+    # also gets </dev/null for the same reason.
+    #
+    # And the end state is VERIFIED by re-listing rather than trusting the
+    # return code of each hide, so a partial failure cannot read as success.
+    #
+    # The match is `grep -qx`, ANCHORED to the whole line, and that is the
+    # important part. A shell `case "$VIS" in *"package:$p"*)` looks equivalent
+    # and is not: `package:com.amazon.tcomm` is also a substring of
+    # `package:com.amazon.tcomm.client`, so three packages appeared un-hidden
+    # because a *different*, longer-named package was visible. That produced a
+    # confident warning about a FireOS limitation that did not exist — `pm hide`
+    # had worked, and dumpsys said hidden=true throughout.
+    res = await _shell_run(live,
+        f'PKGS=$(cat {remote_list}); VIS=$(pm list packages); N=0; '
+        f'for p in $PKGS; do '
+        f'if echo "$VIS" | busybox grep -qx "package:$p"; then '
+        f'pm hide "$p" >/dev/null 2>&1 </dev/null && N=$((N+1)); fi; '
+        f'done; '
+        f'VIS2=$(pm list packages); LEFT=""; '
+        f'for p in $PKGS; do '
+        f'if echo "$VIS2" | busybox grep -qx "package:$p"; then LEFT="$LEFT $p"; fi; '
+        f'done; '
+        f'rm -f {remote_list}; '
+        f'echo HIDDEN_APPLIED:$N; echo STILL_VISIBLE:$LEFT', timeout=180.0)
+
+    applied = 0
+    for tok in res.split():
+        if tok.startswith("HIDDEN_APPLIED:"):
+            try:
+                applied = int(tok.split(":", 1)[1])
+            except ValueError:
+                pass
+    still = ""
+    for line in res.splitlines():
+        if line.strip().startswith("STILL_VISIBLE:"):
+            still = line.split(":", 1)[1].strip()
+    if applied:
+        await _push_log_event(device_id, "info", "controller",
+                              f"debloat: hid {applied} newly-listed package(s) — "
+                              f"persistent ones stop at the next device reboot")
+    if still:
+        await _push_log_event(device_id, "warn", "controller",
+                              f"debloat: {len(still.split())} package(s) could not be "
+                              f"hidden and are still active: {still}")
+    await asyncio.sleep(1.0)
+
+
 async def _exec_shell(live, cmd: str) -> None:
     """Send a command to the device shell and return immediately (fire-and-forget)."""
     try:
@@ -1943,6 +2288,34 @@ async def _post_secure_link(request: web.Request) -> web.Response:
     return _ok({"started": True})
 
 
+@auth.require_admin
+async def _post_debloat(request: web.Request) -> web.Response:
+    """
+    POST /api/devices/{id}/debloat
+
+    Re-apply the debloat payloads to a live device: sync the boot script and
+    hide any newly-listed packages.
+
+    This exists because the OTA-time sync cannot reach every device. A device
+    already running the latest firmware will not be updated again, so it would
+    never receive a payload change — which is exactly the situation the first
+    device hit (Lounge was current when round 2 landed). Idempotent, so
+    pressing it twice costs a `pm list packages` and nothing else.
+    """
+    device_id = request.match_info["id"]
+    live = _devices.get(device_id)
+    if live is None:
+        return _error("device_offline", f"Device not connected: {device_id}", 409)
+
+    # No explicit shell release here: _shell_run and _stream_file_to_device each
+    # acquire and release the session in their own finally, which is why
+    # _sync_start_script does not either. Releasing it from out here could close
+    # a session a concurrent caller had opened.
+    task = asyncio.create_task(_sync_debloat(live, device_id))
+    task.add_done_callback(_log_task_exception_api)
+    return _ok({"started": True})
+
+
 def _log_task_exception_api(task: asyncio.Task) -> None:
     if task.cancelled():
         return
@@ -2098,9 +2471,14 @@ async def _post_global_config(request: web.Request) -> web.Response:
     """
     POST /api/global/config
 
-    Persists new fleet-wide device defaults, then pushes the updated config
-    to every currently-connected device that still has use_global_config=1.
-    Devices with per-device overrides are not affected.
+    Persists new fleet-wide device defaults, then pushes each connected
+    device its freshly resolved EFFECTIVE config.
+
+    Since v8 that means every connected device, not just fully-inheriting
+    ones: a device overriding only Ring still follows the fleet for
+    Microphones, Wake word and the rest, so it has to receive this change.
+    Each device gets its own resolved config rather than the raw body —
+    sending the body would blow away exactly the overrides being respected.
 
     The body REPLACES the stored config. A body that would drop existing
     keys is refused with 409 unless it sets replace=true — see
@@ -2126,47 +2504,26 @@ async def _post_global_config(request: web.Request) -> web.Response:
 
     await loop.run_in_executor(None, db.set_global_device_config, config)
 
-    # Push to all connected devices on global config
+    # Push every connected device its own resolved effective config.
     pushed = []
     for device_id, live in list(_devices.items()):
-        row = await loop.run_in_executor(None, db.get_device, device_id)
-        if row is None or not row["use_global_config"]:
-            continue
-        await live.send_control({"type": "config", **config})
-        if "owwThreshold" in config:
-            live.oww_threshold = float(config["owwThreshold"])
-        if "owwModel" in config:
-            live.oww_model = config["owwModel"]
-            # Refresh HA's wake-word dropdown (lazy import — em_esphome
-            # imports em_api at module level).
-            import em_esphome
-            em_esphome.update_oww_model(device_id, config["owwModel"])
-        if "owwSpeexNs" in config:
-            live.oww_speex_ns = bool(config["owwSpeexNs"])
-        if "nsAsr" in config:
-            live.ns_asr = bool(config["nsAsr"])
-        if "bargeInEnabled" in config:
-            live.barge_in_enabled = bool(config["bargeInEnabled"])
-        if "bargeInThreshold" in config:
-            live.barge_threshold = float(config["bargeInThreshold"])
-        if "wakeArbitrationMs" in config:
-            live.wake_arb_ms = int(config["wakeArbitrationMs"])
-        if "eqBands" in config:
-            live.eq_bands = config["eqBands"]
-        if "eqLoudness" in config:
-            live.eq_loudness = bool(config["eqLoudness"])
-        live.led_scene = em_scenes.resolve(config)
+        effective = await loop.run_in_executor(
+            None, db.get_effective_device_config, device_id
+        )
+        await _apply_live_config(device_id, live, effective)
         pushed.append(device_id)
 
     if pushed:
         log.info(f"[api] Global config pushed to {len(pushed)} device(s): {pushed}")
 
-    # Reconcile BT proxies for every approved on-global device — offline
-    # ones included (proxy mDNS/port lifecycle is independent of the
-    # device connection, unlike the config push above).
+    # Reconcile BT proxies for every approved device — offline ones included
+    # (proxy mDNS/port lifecycle is independent of the device connection,
+    # unlike the config push above). No longer filtered on inheritance: a
+    # device overriding some other section still tracks the fleet's
+    # bleProxyEnabled, and reconcile is idempotent either way.
     all_rows = await loop.run_in_executor(None, db.get_all_devices)
     for row in all_rows:
-        if row["approved"] and row["use_global_config"]:
+        if row["approved"]:
             await em_ble_proxy.reconcile(row["device_id"])
 
     return _ok({"config": config, "pushed_to": pushed})
@@ -2310,13 +2667,35 @@ async def _get_cached_release() -> Optional[dict]:
     last_check = db.get_config("last_update_check")
 
     if version and url:
-        _release_cache = {"version": version, "url": url}
+        _release_cache = {
+            "version":      version,
+            "url":          url,
+            "notes":        db.get_config("latest_notes", "") or "",
+            "release_url":  db.get_config("latest_release_url", "") or "",
+            "published_at": db.get_config("latest_published_at", "") or "",
+        }
         _release_cache_ts = time.monotonic()
 
-        # Re-poll in background if DB cache is older than check interval
+        # If the DB cache has aged out, AWAIT the refresh rather than firing it
+        # into the background and returning the stale value.
+        #
+        # Returning stale here is why "there's an update" showed up
+        # inconsistently and why an OTA could push the previous release: the
+        # caller — dashboard or update endpoint — got the old version and the
+        # fresh one only landed in the cache afterwards, for whoever asked
+        # next. It cost one wrong OTA (v2.9.9 pushed while v2.9.10 was
+        # current, 2026-07-30).
+        #
+        # The cost is a single GitHub round trip, bounded by the 10s timeout in
+        # _fetch_latest_release, and only on the first request after the
+        # interval lapses — release_poll_loop normally refreshes ahead of any
+        # caller. A failed refresh falls through to the stale cache, which is
+        # better than no answer.
         interval = int(db.get_config("update_check_interval", "3600") or 3600)
         if not last_check or (time.time() - float(last_check)) > interval:
-            asyncio.create_task(_fetch_latest_release())
+            fresh = await _fetch_latest_release()
+            if fresh:
+                return fresh
 
         return _release_cache
 
@@ -2353,6 +2732,11 @@ async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
         # `server` asset attached. The list is newest-first.
         tag = None
         binary = None
+        # Initialised explicitly: it is only assigned inside the loop, and
+        # while the `binary is None` return below happens to cover that today,
+        # relying on one guard to protect another variable is how a later edit
+        # introduces a NameError on a path nobody runs in testing.
+        release: dict = {}
         for data in releases:
             if data.get("draft") or data.get("prerelease"):
                 continue
@@ -2366,6 +2750,7 @@ async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
             if candidate_binary is None:
                 continue
             tag, binary = candidate_tag, candidate_binary
+            release = data
             break
 
         if binary is None:
@@ -2374,16 +2759,46 @@ async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
 
         download_url = binary["browser_download_url"]
 
+        # Release notes, so the dashboard can show WHAT an update changes
+        # rather than only that one exists. Deciding whether to push firmware
+        # to a device you rely on, from a version number alone, is not a
+        # decision — it is a guess. The body comes from the annotated tag (see
+        # .github/workflows/release.yml), which is why tags are annotated.
+        notes = (release.get("body") or "").strip()
+
+        previous_tag = db.get_config("latest_version")
+
         # Persist to DB
         db.set_config("latest_version",    tag)
         db.set_config("latest_binary_url", download_url)
+        db.set_config("latest_notes",      notes)
+        db.set_config("latest_release_url", release.get("html_url") or "")
+        db.set_config("latest_published_at", release.get("published_at") or "")
         db.set_config("last_update_check", str(time.time()))
 
         # Update in-memory cache
-        _release_cache    = {"version": tag, "url": download_url}
+        _release_cache    = {
+            "version":      tag,
+            "url":          download_url,
+            "notes":        notes,
+            "release_url":  release.get("html_url") or "",
+            "published_at": release.get("published_at") or "",
+        }
         _release_cache_ts = time.monotonic()
 
         log.info(f"[api] Latest release: {tag}")
+        if tag != previous_tag:
+            # Tell any open dashboard, so a tab that is already showing the
+            # Updates panel does not sit on the old version until someone
+            # reloads or presses Check now.
+            log.info(f"[api] Release changed {previous_tag or '(none)'} -> {tag}")
+            await _push_event({
+                "type":         "release_update",
+                "version":      tag,
+                "notes":        notes,
+                "release_url":  release.get("html_url") or "",
+                "published_at": release.get("published_at") or "",
+            })
         return _release_cache
 
     except Exception as e:
@@ -2536,6 +2951,37 @@ def _require_str(body: dict, key: str) -> str:
 
 # ─── Device state merge ───────────────────────────────────────────────────────
 
+def _stored_volume(row):
+    """Last-known volume as an HA 0..1 float, from the persisted config."""
+    try:
+        level = json.loads(row["config"] or "{}").get("startupVolume")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if level is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(level) / 175.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_sections(row) -> list:
+    """
+    Overridden config sections from a device row, tolerant of a row that
+    predates the v8 column or carries unparseable JSON — either way the safe
+    reading is "overrides nothing", which shows the device as fleet-scoped
+    rather than inventing overrides it does not have.
+    """
+    try:
+        raw = row["config_sections"]
+    except (IndexError, KeyError):
+        return []
+    try:
+        return sections_mod.normalise(json.loads(raw or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _merge_device(row) -> dict:
     """
     Merge a DB device row with live in-memory state.
@@ -2558,7 +3004,9 @@ def _merge_device(row) -> dict:
         "first_seen":         row["first_seen"],
         "last_seen":          row["last_seen"],
         "config":             json.loads(row["config"] or "{}"),
-        "use_global_config":  bool(row["use_global_config"]),
+        "config_sections":    _row_sections(row),
+        # Compat view for older readers: no overridden sections == fleet.
+        "use_global_config":  not _row_sections(row),
         "esphome_port":       row["esphome_api_port"],
         "ble_proxy_port":     row["ble_proxy_port"],
         # Live — defaults when device is not connected
@@ -2568,6 +3016,16 @@ def _merge_device(row) -> dict:
         "listening":        getattr(live, "listening", False) if live else False,
         "thinking":         getattr(live, "thinking",  False) if live else False,
         "stats":            live.stats if live else None,
+        # Control-plane round trip, controller-measured. The RF counters are
+        # structurally zero on this hardware (the MTK driver populates
+        # neither retries nor noise), so this is the only latency signal.
+        "rttMs":            getattr(live, "rtt_last_ms", None) if live else None,
+        # Volume is persisted device state, not config (see
+        # em_config_sections.STATE_KEYS): the live level while connected,
+        # otherwise the last one the device reported, so an offline device
+        # still shows where it will come back.
+        "volume":           (live.volume if live is not None
+                             else _stored_volume(row)),
         # Controller-side BT proxy state — non-None only while the device's
         # bleProxyEnabled config has a proxy server instantiated.
         "bleProxy":         em_ble_proxy.get_status(device_id),
@@ -2579,6 +3037,11 @@ def _merge_device(row) -> dict:
         # the rest of this "Live" section (resets on reconnect, since it
         # lives on the per-connection Device object, not the DB row).
         "owwNearMisses":    getattr(live, "oww_near_misses", 0) if live else 0,
+        # What this firmware can be asked to do, by capability rather than by
+        # version comparison. Drives whether the dashboard OFFERS on-device
+        # scoring: a toggle that silently does nothing on old firmware is worse
+        # than no toggle, because it looks like the feature is broken.
+        "owwShadowCapable": getattr(live, "oww_shadow_capable", False) if live else False,
         # WiFi change state (survives the reconnect a change causes)
         "wifi":             wifi_state(device_id),
         # Update state

@@ -29,11 +29,22 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
+import em_config_sections
+import em_recordings
+
 log = logging.getLogger("echomuse.db")
 
 # ─── Default device config ────────────────────────────────────────────────────
 
 DEFAULT_DEVICE_CONFIG = {
+    # owwOnDevice: on-device wake word scoring. "off" or "shadow".
+    # Shadow scores the wake stream on the device and reports what it WOULD
+    # have detected, without acting on it, so the two can be compared on the
+    # same audio. Default off and it should stay that way: it costs ~38% of one
+    # core permanently on top of the ~18-20% mic-pipeline baseline, and it
+    # needs ONNX Runtime plus the models installed on the device out of band
+    # (they are not in the firmware). Enable on ONE device at a time.
+    "owwOnDevice":      "off",
     "adcDigitalGain":   88,
     "adcMicpga":        40,
     # micGainDb: fixed digital gain (dB) the device applies to the full
@@ -118,6 +129,16 @@ DEFAULT_DEVICE_CONFIG = {
     # files are missing (bare-metal without NS_MODEL_DIR) the flag
     # degrades to raw streaming with a warning.
     "nsAsr":            False,
+    # saveUtterances: keep the mic audio of the last few voice turns
+    # (em_recordings.KEEP_PER_DEVICE) as WAVs, downloadable from the
+    # Activity tab. Diagnostic tooling for "is my mic any good" — the
+    # question you otherwise have to answer by inference from a bad
+    # transcript. Default OFF and deliberately so: this is the only feature
+    # that writes recognisable speech to disk, and turning it on should be
+    # a decision, not a default someone discovers later. Controller-side
+    # only (the device never sees the audio again); the key rides the
+    # config channel and the device ignores it, same as wakeArbitrationMs.
+    "saveUtterances":   False,
     # bleProxyEnabled: BLE proxy (device-side passive scan over the raw HCI
     # transport, forwarded to HA as a separate ESPHome bluetooth_proxy
     # device — em_ble_proxy.py). Default off: enabling durably disables the
@@ -139,6 +160,18 @@ DEFAULT_DEVICE_CONFIG = {
     "ledScene":         "standard",
     "ledListenColor":   "#00b400",
     "ledThinkColor":    "#00c800",
+    # Playback "meter" ring response curve — how hard the ring throbs with
+    # the speaker level. Device-side defaults live in animator.go
+    # (meterDefaults) and these mirror them; both are clamped independently.
+    # Exposed as config because it is a taste parameter that needs several
+    # passes in a real room, and a firmware OTA per pass is not a sane
+    # tuning loop. See docs/led-ring-states.md.
+    "meterAttack":      0.6,   # envelope rise per 40ms tick
+    "meterDecay":       0.30,  # fall per tick; ~133ms tracks syllable rate
+    "meterFloor":       0.06,  # perceptual brightness at silence
+    "meterGamma":       2.2,   # >1 expands the dark end so the swing reads
+    "meterRef":         0.22,  # speaker RMS mapped to full brightness
+    "meterCurve":       0.7,   # <1 lifts quiet consonants
     # agcEnabled: automatic gain control (lockMic/button turn streams only).
     # Disable to hear raw mic levels. (nsEnabled/RNNoise removed 2026-07-12
     # with the device-side RNNoise code — a stale nsEnabled key in stored
@@ -402,7 +435,210 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '7' WHERE key = 'schema_version';
     """,
+
+    # ── v8 — per-section fleet/device config scoping ─────────────────────────
+    #
+    # use_global_config was one boolean for the whole config, so overriding a
+    # single setting on one device forked every other setting too and froze
+    # them against future fleet changes. config_sections replaces it with the
+    # set of sections a device overrides (ids from em_config_sections).
+    #
+    # The backfill is lossless in both directions:
+    #   use_global_config = 1  ->  '[]'    (inherits everything, as before)
+    #   use_global_config = 0  ->  all ids (overrides everything, as before)
+    # so every device's effective config is byte-identical across the upgrade.
+    #
+    # use_global_config is KEPT rather than dropped: SQLite cannot drop a
+    # column without a table rebuild, and it stays useful as the compat view
+    # (no sections overridden == following the fleet), which older API
+    # consumers and the migration itself both rely on.
+    """
+    ALTER TABLE devices ADD COLUMN config_sections TEXT NOT NULL DEFAULT '[]';
+
+    UPDATE devices
+       SET config_sections = '["playback","wakeword","microphones","ring","advanced","bluetooth"]'
+     WHERE use_global_config = 0;
+
+    UPDATE system_config SET value = '8' WHERE key = 'schema_version';
+    """,
+
+    # ── v9 — control-plane RTT ───────────────────────────────────────────────
+    #
+    # The RF layer is opaque on this hardware: the MTK driver leaves
+    # retry/discard/missed-beacon at zero in /proc/net/wireless and reports
+    # NOISE=9999, so tx_errors/tx_dropped/rx_crc (added in v7) are
+    # STRUCTURALLY zero here and prove nothing either way. RTT measures the
+    # latency that actually degrades the experience, needs no driver support,
+    # and separates the hypotheses: contention makes latency track load,
+    # power-save makes it spike when idle. Hence excursions are split by
+    # whether the device was busy when the probe went out.
+    """
+    ALTER TABLE device_metrics ADD COLUMN rtt_sum_ms          INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE device_metrics ADD COLUMN rtt_samples         INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE device_metrics ADD COLUMN rtt_min_ms          INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN rtt_max_ms          INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN rtt_excursions      INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE device_metrics ADD COLUMN rtt_excursions_idle INTEGER NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '9' WHERE key = 'schema_version';
+    """,
+
+    # ── v10 — RTT idle-sample denominator ───────────────────────────────────
+    #
+    # Added immediately after v9 because v9 shipped without it and the
+    # excursion split is meaningless without a denominator: "every excursion
+    # happened while idle" is vacuous when almost every SAMPLE is idle.
+    #
+    # This is its own migration rather than an edit to v9 for the reason
+    # stated at the top of this list — migrations are APPEND-ONLY. Editing v9
+    # after a DB had already reached schema_version 9 meant the column was
+    # never created, and every stats report then failed with "no column named
+    # rtt_samples_idle", disconnecting all three devices in a loop
+    # (2026-07-25, caught within a minute by the post-deploy error check).
+    """
+    ALTER TABLE device_metrics ADD COLUMN rtt_samples_idle INTEGER NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '10' WHERE key = 'schema_version';
+    """,
+
+    # ── v11 — prune configs to match their scoping ──────────────────────────
+    #
+    # v8 backfilled config_sections but left the config column alone, so a
+    # device that had been fully inheriting still stored a value for every
+    # key. Harmless to the DEVICE (get_effective_device_config only reads
+    # in-scope keys) but not to the dashboard, which merged the stored dict
+    # over the fleet config and so displayed a device's stale settings while
+    # every section claimed to be following the fleet — Office showed
+    # hey_rhasspy/standard while actually running hey_mycroft/malevolent.
+    #
+    # The display bug is fixed properly in dashboard.jsx (filter, don't
+    # merge). This makes the stored state honest as well, so the invariant
+    # asserted in set_device_config_sections holds for migrated rows too.
+    # Marked as a no-op SQL statement; the real work runs in Python below,
+    # because pruning needs the section map.
+    """
+    UPDATE system_config SET value = '11' WHERE key = 'schema_version';
+    """,
+
+    # ── v12 — utterance recordings ──────────────────────────────────────────
+    #
+    # Filename (not a blob) of the saved mic audio for this turn. The WAV
+    # itself lives in recordings/ beside this DB and is retained by file
+    # count per device (em_recordings.KEEP_PER_DEVICE), which is a much
+    # shorter window than TURN_RETENTION — so a non-NULL audio_file on an
+    # older row is a claim to CHECK, not to trust. Every reader resolves
+    # through em_recordings and treats a missing file as "no recording".
+    """
+    ALTER TABLE turns ADD COLUMN audio_file TEXT;
+
+    UPDATE system_config SET value = '12' WHERE key = 'schema_version';
+    """,
+
+    # ── v13 — on-device wake word shadow mode ───────────────────────────────
+    #
+    # Two levels, because they answer different questions.
+    #
+    # Per turn (dev_wake_*): when the CONTROLLER woke, did the device agree,
+    # and how far apart were they? This is the comparison that decides whether
+    # on-device detection is good enough to trust. NULL means one of three
+    # things and they are not the same: shadow mode was off, the device's
+    # firmware predates it, or the device genuinely did not cross the threshold
+    # for this utterance. The third is a finding; the first two are absence of
+    # data. dev_shadow distinguishes them — 1 when the device was known to be
+    # scoring at the time, so a NULL score alongside it is a real miss.
+    #
+    # Per hour (wake_counters.dev_*): what did the device see when the
+    # controller did NOT wake? Crossings with no corresponding turn are the
+    # false-accept side of the comparison, which per-turn rows structurally
+    # cannot show. dev_frames is the denominator that makes the rest legible,
+    # and dev_drops says whether the device kept up at all — a shadow run that
+    # dropped half its frames is not evidence about detection quality.
+    """
+    ALTER TABLE turns ADD COLUMN dev_wake_score REAL;
+    ALTER TABLE turns ADD COLUMN dev_wake_delta_ms INTEGER;
+    ALTER TABLE turns ADD COLUMN dev_shadow INTEGER;
+
+    ALTER TABLE wake_counters ADD COLUMN dev_frames    INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE wake_counters ADD COLUMN dev_drops     INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE wake_counters ADD COLUMN dev_crossings INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE wake_counters ADD COLUMN dev_max_score REAL    NOT NULL DEFAULT 0;
+
+    UPDATE system_config SET value = '13' WHERE key = 'schema_version';
+    """,
+
+    # ── v14 — thermals and CPU topology ─────────────────────────────────────
+    #
+    # cpu_temp_* / max_temp_max: this SoC has 11 thermal zones; mtktscpu is the
+    # CPU and the max-of-all catches a PMIC or board sensor running hotter than
+    # the CPU, which is where trouble shows up first.
+    #
+    # cores_online_* exists because cpu_pct is NOT self-describing: it comes
+    # from the aggregate /proc/stat line, so it is a share of ONLINE capacity,
+    # and MTK parks 3 of 4 cores when idle. The same absolute work reads as half
+    # the percentage once a second core comes up — so a cpu_pct series without
+    # the core count beside it can show a "drop" that is purely a change of
+    # divisor. cores_online_min is the interesting end: it is the tightest the
+    # device ever was.
+    #
+    # thermal_limit_min < cores_total means the thermal governor capped capacity
+    # at some point in the hour, which is the throttling signal that matters
+    # more than any single temperature.
+    """
+    ALTER TABLE device_metrics ADD COLUMN cpu_temp_sum     REAL    NOT NULL DEFAULT 0;
+    ALTER TABLE device_metrics ADD COLUMN cpu_temp_samples INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE device_metrics ADD COLUMN cpu_temp_max     REAL;
+    ALTER TABLE device_metrics ADD COLUMN max_temp_max     REAL;
+    ALTER TABLE device_metrics ADD COLUMN cores_online_last INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN cores_online_min  INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN cores_total       INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN thermal_limit_min INTEGER;
+
+    UPDATE system_config SET value = '14' WHERE key = 'schema_version';
+    """,
+
+    # ── v15 — the device's own wake threshold, per turn ─────────────────────
+    #
+    # Needed to tell a real on-device miss from a comparison that was never
+    # valid. The controller lowers its wake bar to bargeInThreshold while the
+    # speaker is playing (echo at the mic is ~25dB louder than the person), so
+    # a turn that fired at 0.055 was not something a device scoring against
+    # 0.5 could have caught. Before this, those were counted as misses and the
+    # agreement figure was pessimistic.
+    #
+    # NULL means the device did not report a threshold (firmware predating it),
+    # in which case the turn is counted as neither agreed nor missed rather
+    # than guessed at.
+    """
+    ALTER TABLE turns ADD COLUMN dev_threshold REAL;
+
+    UPDATE system_config SET value = '15' WHERE key = 'schema_version';
+    """,
 ]
+
+# Post-migration fixups that need Python rather than SQL. Keyed by the schema
+# version they belong to; run once, immediately after that migration applies.
+def _fixup_v11(conn) -> None:
+    rows = conn.execute("SELECT device_id, config, config_sections FROM devices").fetchall()
+    for row in rows:
+        try:
+            cfg  = json.loads(row["config"] or "{}") or {}
+            secs = em_config_sections.normalise(json.loads(row["config_sections"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        keep = em_config_sections.keys_for(secs) | em_config_sections.STATE_KEYS
+        pruned = {k: v for k, v in cfg.items() if k in keep}
+        if len(pruned) != len(cfg):
+            conn.execute(
+                "UPDATE devices SET config = ? WHERE device_id = ?",
+                (json.dumps(pruned), row["device_id"]),
+            )
+            log.info(
+                f"[db] v11: pruned {len(cfg) - len(pruned)} out-of-scope config "
+                f"key(s) from {row['device_id']}"
+            )
+
+
+_MIGRATION_FIXUPS = {11: _fixup_v11}
 
 # ─── Connection management ────────────────────────────────────────────────────
 
@@ -499,6 +735,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         log.info(f"Applying migration v{version}")
         try:
             conn.executescript(sql)
+            # Some migrations need data work that SQL cannot express (e.g.
+            # pruning JSON config against the section map). Runs inside the
+            # same transaction as its DDL so a failure rolls both back.
+            fixup = _MIGRATION_FIXUPS.get(version)
+            if fixup is not None:
+                fixup(conn)
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -610,6 +852,29 @@ def upsert_device_seen(
             WHERE device_id = ?
             """,
             (ip, version, _now(), device_id),
+        )
+
+
+def touch_device_seen(device_id: str) -> None:
+    """
+    Refresh last_seen only — the device is alive right now.
+
+    upsert_device_seen fires on connect, which made last_seen mean "last
+    CONNECTED": a device online and healthy for hours still displayed a
+    last_seen from whenever it last reconnected (observed 2026-07-25:
+    all three devices reading 88-91 minutes stale while streaming audio
+    fine). That is precisely backwards from what the field is for —
+    knowing when a device went away.
+
+    Called from the ~30s stats report, so last_seen is at most one report
+    stale while connected and lands within ~30s of the truth when a device
+    drops. It rides the same executor hop as record_device_stats, so it
+    adds no write the loop wasn't already making.
+    """
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET last_seen = ? WHERE device_id = ?",
+            (_now(), device_id),
         )
 
 
@@ -755,22 +1020,68 @@ def set_global_device_config(config: dict) -> None:
         )
 
 
+def get_device_config_sections(device_id: str) -> list:
+    """The section ids this device overrides. Empty list = follows the fleet."""
+    row = _q1("SELECT config_sections FROM devices WHERE device_id = ?", (device_id,))
+    if row is None:
+        return []
+    try:
+        return em_config_sections.normalise(json.loads(row["config_sections"]) or [])
+    except (json.JSONDecodeError, TypeError):
+        log.warning(f"[db] Invalid config_sections for {device_id} — treating as fleet")
+        return []
+
+
+def set_device_config_sections(device_id: str, section_ids) -> list:
+    """
+    Set which sections this device overrides, and drop the stored values for
+    any section it no longer does.
+
+    Discarding on revert is deliberate and matches the pre-v8 behaviour of
+    set_device_use_global (which reset the whole config to a copy of global):
+    a section that follows the fleet should hold no stale shadow values that
+    silently reappear if it is toggled back months later.
+
+    use_global_config is kept in step as the compat view for older readers.
+    """
+    sections = em_config_sections.normalise(section_ids)
+    kept = em_config_sections.keys_for(sections) | em_config_sections.STATE_KEYS
+    stored = get_device_config(device_id)
+    pruned = {k: v for k, v in stored.items() if k in kept}
+    with _tx() as conn:
+        conn.execute(
+            """
+            UPDATE devices
+               SET config_sections   = ?,
+                   config            = ?,
+                   use_global_config = ?
+             WHERE device_id = ?
+            """,
+            (json.dumps(sections), json.dumps(pruned),
+             0 if sections else 1, device_id),
+        )
+    return sections
+
+
 def get_effective_device_config(device_id: str) -> dict:
     """
     Return the config that should be pushed to a device.
 
-    If use_global_config=1 (or the device is not found), returns the
-    fleet-wide global config — but always overrides startupVolume with
-    the device's own stored value. Volume is hardware state set at
-    provisioning time; it should never be clobbered by a fleet default.
+    Fleet config, with this device's own values layered over it for whichever
+    sections it overrides (see em_config_sections). No overridden sections =
+    pure fleet config. Every section overridden = fully device-specific, which
+    is what the pre-v8 use_global_config=0 meant.
 
-    If use_global_config=0, returns the device's own config entirely.
+    STATE_KEYS (startupVolume) always come from the device when present,
+    regardless of scoping — that is this device's own hardware state, and
+    inheriting it from the fleet would bring a device back at another room's
+    volume.
 
     This is the authoritative source for what config a device should
     actually run — use it in device_connected() and any config-push path.
     """
     row = _q1(
-        "SELECT use_global_config, config FROM devices WHERE device_id = ?",
+        "SELECT config_sections, config FROM devices WHERE device_id = ?",
         (device_id,),
     )
     if row is None:
@@ -782,14 +1093,17 @@ def get_effective_device_config(device_id: str) -> dict:
         log.warning(f"[db] Invalid config JSON for {device_id} — using global")
         per_device = {}
 
-    if row["use_global_config"]:
-        config = get_global_device_config()
-        # startupVolume is per-device hardware state — never inherit from global
-        if "startupVolume" in per_device:
-            config["startupVolume"] = per_device["startupVolume"]
-        return config
-    else:
-        return per_device or get_global_device_config()
+    try:
+        sections = em_config_sections.normalise(
+            json.loads(row["config_sections"]) or []
+        )
+    except (json.JSONDecodeError, TypeError):
+        log.warning(f"[db] Invalid config_sections for {device_id} — using global")
+        sections = []
+
+    return em_config_sections.merge(
+        get_global_device_config(), per_device, sections
+    )
 
 
 def set_device_use_global(device_id: str, enabled: bool) -> None:
@@ -839,10 +1153,21 @@ def delete_device(device_id: str) -> None:
 
     This is a hard delete — use with care. Logs are removed first to
     satisfy the foreign key constraint.
+
+    Saved utterance recordings live on disk rather than in the DB, so no
+    cascade reaches them — they are unlinked explicitly here. Leaving a
+    deleted device's speech behind on the volume is the one leftover that
+    actually matters.
     """
     with _tx() as conn:
         conn.execute("DELETE FROM device_logs WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+    try:
+        removed = em_recordings.delete_device(device_id)
+        if removed:
+            log.info(f"[db] Removed {removed} recording(s) for {device_id}")
+    except Exception as e:
+        log.warning(f"[db] Recording cleanup failed for {device_id}: {e}")
     log.info(f"[db] Device deleted: {device_id}")
 
 
@@ -1089,6 +1414,19 @@ _TURN_COLUMNS = {
     "send_ms":          "send_ms",
     "delivery_ms":      "delivery_ms",
     "eq_ms":            "eq_ms",
+    # v13 — on-device shadow comparison. dev_shadow is the "was the device
+    # scoring at all" flag that stops a NULL dev_wake_score from being read as
+    # a miss when it is really absence of data.
+    "dev_wake_score":    "dev_wake_score",
+    "dev_wake_delta_ms": "dev_wake_delta_ms",
+    "dev_shadow":        "dev_shadow",
+    # v15 — the threshold the device was scoring against, so a non-crossing can
+    # be judged rather than assumed to be a miss.
+    "dev_threshold":     "dev_threshold",
+    # v12 — filename of the saved utterance WAV, written by set_turn_audio
+    # after the insert (the name is keyed on the rowid). Always NULL at
+    # insert time; listed here so get_turns returns it.
+    "audio_file":       "audio_file",
 }
 
 
@@ -1160,6 +1498,22 @@ def set_turn_playback(turn_id: int, periods: int, underruns: int,
         )
 
 
+def set_turn_audio(turn_id: int, audio_file: Optional[str]) -> None:
+    """
+    Attach a saved utterance recording to a persisted turn.
+
+    Separate from insert_turn because the filename is keyed on the rowid
+    that insert_turn returns — naming by timestamp instead would collide
+    across devices and give the download endpoint nothing to bind the file
+    to its turn with.
+    """
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE turns SET audio_file = ? WHERE id = ?",
+            (audio_file, turn_id),
+        )
+
+
 def set_turn_delivery(turn_id: int, send_ms: int, delivery_ms: int,
                       eq_ms: int) -> None:
     """
@@ -1212,20 +1566,37 @@ def bump_wake_counters(
     near_misses: int = 0,
     near_miss_max: float = 0.0,
     underruns: int = 0,
+    dev_frames: int = 0,
+    dev_drops: int = 0,
+    dev_crossings: int = 0,
+    dev_max_score: float = 0.0,
 ) -> None:
-    """Accumulate into the current hour's wake_counters row (upsert)."""
+    """
+    Accumulate into the current hour's wake_counters row (upsert).
+
+    The dev_* arguments are the on-device shadow window summary (schema v13),
+    which rides the device's existing ~30s stats report — so on-device scoring
+    adds one upsert per 30s per device and nothing per audio frame.
+    """
     hour_ts = int(time.time()) // 3600 * 3600
     with _tx() as conn:
         conn.execute(
             """
-            INSERT INTO wake_counters (device_id, hour_ts, near_misses, near_miss_max, underruns)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO wake_counters (device_id, hour_ts, near_misses, near_miss_max,
+                                       underruns, dev_frames, dev_drops, dev_crossings,
+                                       dev_max_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (device_id, hour_ts) DO UPDATE SET
                 near_misses   = near_misses + excluded.near_misses,
                 near_miss_max = MAX(near_miss_max, excluded.near_miss_max),
-                underruns     = underruns + excluded.underruns
+                underruns     = underruns + excluded.underruns,
+                dev_frames    = dev_frames + excluded.dev_frames,
+                dev_drops     = dev_drops + excluded.dev_drops,
+                dev_crossings = dev_crossings + excluded.dev_crossings,
+                dev_max_score = MAX(dev_max_score, excluded.dev_max_score)
             """,
-            (device_id, hour_ts, _py(near_misses), _py(near_miss_max), _py(underruns)),
+            (device_id, hour_ts, _py(near_misses), _py(near_miss_max), _py(underruns),
+             _py(dev_frames), _py(dev_drops), _py(dev_crossings), _py(dev_max_score)),
         )
         conn.execute(
             "DELETE FROM wake_counters WHERE hour_ts < ?",
@@ -1254,6 +1625,11 @@ def record_device_stats(device_id: str, stats: dict) -> None:
     mem     = stats.get("memUsedMb")
     rssi    = stats.get("wifiRssi")
     link_speed = stats.get("linkSpeedMbps")
+    cpu_temp   = stats.get("cpuTempC")
+    max_temp   = stats.get("maxTempC")
+    cores_on   = stats.get("coresOnline")
+    cores_tot  = stats.get("coresTotal")
+    therm_lim  = stats.get("thermalCoreLimit")
     with _tx() as conn:
         conn.execute(
             """
@@ -1263,9 +1639,16 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 rssi_sum, rssi_samples, rssi_min,
                 link_speed_last, link_speed_min, wifi_freq_last,
                 wifi_bssid_last, tx_bytes_sum, rx_bytes_sum,
-                tx_errors_sum, tx_dropped_sum, rx_crc_sum
+                tx_errors_sum, tx_dropped_sum, rx_crc_sum,
+                rtt_sum_ms, rtt_samples, rtt_min_ms, rtt_max_ms,
+                rtt_excursions, rtt_excursions_idle, rtt_samples_idle,
+                cpu_temp_sum, cpu_temp_samples, cpu_temp_max, max_temp_max,
+                cores_online_last, cores_online_min, cores_total,
+                thermal_limit_min
             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (device_id, hour_ts) DO UPDATE SET
                 samples          = samples + 1,
                 cpu_sum          = cpu_sum + excluded.cpu_sum,
@@ -1284,6 +1667,28 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 -- mid-hour should be visible as the new one); link_speed_min
                 -- keeps the worst PHY rate seen, which is the number that
                 -- matters when hunting a throughput collapse.
+                -- Thermals: sum/samples for a mean that ignores reports where
+                -- the sensor was unreadable, plus the peak. cores_online_min is
+                -- the tightest the device ever ran; thermal_limit_min below
+                -- cores_total means throttling happened this hour.
+                cpu_temp_sum     = cpu_temp_sum + excluded.cpu_temp_sum,
+                cpu_temp_samples = cpu_temp_samples + excluded.cpu_temp_samples,
+                cpu_temp_max     = MAX(COALESCE(cpu_temp_max, excluded.cpu_temp_max),
+                                       COALESCE(excluded.cpu_temp_max, cpu_temp_max)),
+                max_temp_max     = MAX(COALESCE(max_temp_max, excluded.max_temp_max),
+                                       COALESCE(excluded.max_temp_max, max_temp_max)),
+                cores_online_last = COALESCE(excluded.cores_online_last, cores_online_last),
+                cores_online_min  = CASE
+                    WHEN excluded.cores_online_min IS NULL THEN cores_online_min
+                    ELSE MIN(COALESCE(cores_online_min, excluded.cores_online_min),
+                             excluded.cores_online_min)
+                END,
+                cores_total       = COALESCE(excluded.cores_total, cores_total),
+                thermal_limit_min = CASE
+                    WHEN excluded.thermal_limit_min IS NULL THEN thermal_limit_min
+                    ELSE MIN(COALESCE(thermal_limit_min, excluded.thermal_limit_min),
+                             excluded.thermal_limit_min)
+                END,
                 link_speed_last  = COALESCE(excluded.link_speed_last, link_speed_last),
                 link_speed_min   = CASE
                     WHEN excluded.link_speed_min IS NULL THEN link_speed_min
@@ -1296,7 +1701,24 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 rx_bytes_sum     = rx_bytes_sum   + excluded.rx_bytes_sum,
                 tx_errors_sum    = tx_errors_sum  + excluded.tx_errors_sum,
                 tx_dropped_sum   = tx_dropped_sum + excluded.tx_dropped_sum,
-                rx_crc_sum       = rx_crc_sum     + excluded.rx_crc_sum
+                rx_crc_sum       = rx_crc_sum     + excluded.rx_crc_sum,
+                -- RTT arrives pre-aggregated over the window between stats
+                -- reports, so sums accumulate and the extremes take the
+                -- better/worse of the two. NULL means no samples landed in
+                -- that window and must not poison the running min.
+                rtt_sum_ms       = rtt_sum_ms  + excluded.rtt_sum_ms,
+                rtt_samples      = rtt_samples + excluded.rtt_samples,
+                rtt_min_ms       = CASE
+                    WHEN excluded.rtt_min_ms IS NULL THEN rtt_min_ms
+                    ELSE MIN(COALESCE(rtt_min_ms, excluded.rtt_min_ms), excluded.rtt_min_ms)
+                END,
+                rtt_max_ms       = CASE
+                    WHEN excluded.rtt_max_ms IS NULL THEN rtt_max_ms
+                    ELSE MAX(COALESCE(rtt_max_ms, excluded.rtt_max_ms), excluded.rtt_max_ms)
+                END,
+                rtt_excursions      = rtt_excursions      + excluded.rtt_excursions,
+                rtt_excursions_idle = rtt_excursions_idle + excluded.rtt_excursions_idle,
+                rtt_samples_idle    = rtt_samples_idle    + excluded.rtt_samples_idle
             """,
             (
                 device_id, hour_ts,
@@ -1315,6 +1737,25 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 int(stats.get("txBytes") or 0), int(stats.get("rxBytes") or 0),
                 int(stats.get("txErrors") or 0), int(stats.get("txDropped") or 0),
                 int(stats.get("rxCrcErrors") or 0),
+                # RTT is controller-measured and folded into the same report
+                # (see Device.drain_rtt). Absent when no probe completed in
+                # the window — NULL rather than 0 so the min stays honest.
+                int(stats.get("rttSumMs") or 0), int(stats.get("rttSamples") or 0),
+                stats.get("rttMinMs"), stats.get("rttMaxMs"),
+                int(stats.get("rttExcursions") or 0),
+                int(stats.get("rttExcursionsIdle") or 0),
+                int(stats.get("rttSamplesIdle") or 0),
+                # Thermals. NULL, never 0, when a sensor was unreadable — a
+                # zeroed temperature would drag a mean down and read as a cool
+                # device, which is the wrong direction for a safety metric.
+                float(cpu_temp) if cpu_temp is not None else 0.0,
+                1 if cpu_temp is not None else 0,
+                float(cpu_temp) if cpu_temp is not None else None,
+                float(max_temp) if max_temp is not None else None,
+                int(cores_on) if cores_on else None,
+                int(cores_on) if cores_on else None,
+                int(cores_tot) if cores_tot else None,
+                int(therm_lim) if therm_lim else None,
             ),
         )
         conn.execute(
@@ -1347,6 +1788,56 @@ def get_device_metrics(device_id: str, since: float) -> list[dict]:
             "storage_total_mb": r["storage_total_mb"],
             "rssi_avg":         round(r["rssi_sum"] / r["rssi_samples"], 1) if r["rssi_samples"] else None,
             "rssi_min":         r["rssi_min"],
+            # Link identity + throughput (v7). These were persisted but never
+            # surfaced here, so the activity API could not answer "was the
+            # link different when this went wrong?".
+            # Thermals + topology (v14). cpu_temp_avg divides by its OWN
+            # sample count, not `samples`: a report where the sensor was
+            # unreadable must not dilute the mean.
+            "cpu_temp_avg":      round(r["cpu_temp_sum"] / r["cpu_temp_samples"], 1) if r["cpu_temp_samples"] else None,
+            "cpu_temp_max":      r["cpu_temp_max"],
+            "max_temp_max":      r["max_temp_max"],
+            # cores_online is what makes cpu_avg legible — that percentage is a
+            # share of ONLINE capacity, so a series can appear to halve when
+            # only the divisor changed.
+            "cores_online_last": r["cores_online_last"],
+            "cores_online_min":  r["cores_online_min"],
+            "cores_total":       r["cores_total"],
+            # Below cores_total means the thermal governor capped capacity.
+            "thermal_limit_min": r["thermal_limit_min"],
+            "link_speed_last":  r["link_speed_last"],
+            "link_speed_min":   r["link_speed_min"],
+            "wifi_freq_last":   r["wifi_freq_last"],
+            "wifi_bssid_last":  r["wifi_bssid_last"],
+            "tx_bytes":         r["tx_bytes_sum"],
+            "rx_bytes":         r["rx_bytes_sum"],
+            # NOTE: tx_errors/tx_dropped/rx_crc are deliberately NOT exposed.
+            # The MTK driver leaves every one of them at zero regardless of
+            # link quality (/proc/net/wireless reports no retries or missed
+            # beacons, signal_poll reports NOISE=9999), so surfacing them
+            # would invite reading "0 errors" as "healthy link" — which is
+            # exactly the mistake they caused on 2026-07-25.
+            #
+            # Control-plane RTT (v9) is the latency signal that actually
+            # works on this hardware. excursions_idle vs excursions is the
+            # discriminator: contention makes latency track load, power-save
+            # makes it spike when the device is doing nothing.
+            "rtt_avg_ms":       round(r["rtt_sum_ms"] / r["rtt_samples"], 1) if r["rtt_samples"] else None,
+            "rtt_min_ms":       r["rtt_min_ms"],
+            "rtt_max_ms":       r["rtt_max_ms"],
+            "rtt_samples":      r["rtt_samples"],
+            "rtt_excursions":      r["rtt_excursions"],
+            "rtt_excursions_idle": r["rtt_excursions_idle"],
+            "rtt_samples_idle":    r["rtt_samples_idle"],
+            # Excursion RATE per state — the actual discriminator. Comparing
+            # raw counts is vacuous when almost every sample is idle.
+            "rtt_excursion_pct_idle": (
+                round(100.0 * r["rtt_excursions_idle"] / r["rtt_samples_idle"], 1)
+                if r["rtt_samples_idle"] else None),
+            "rtt_excursion_pct_busy": (
+                round(100.0 * (r["rtt_excursions"] - r["rtt_excursions_idle"])
+                      / (r["rtt_samples"] - r["rtt_samples_idle"]), 1)
+                if (r["rtt_samples"] - r["rtt_samples_idle"]) else None),
         })
     return out
 

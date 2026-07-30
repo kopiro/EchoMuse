@@ -149,7 +149,9 @@ The LED ring tells you what's happening:
 ## Everyday things
 
 - **Updates**: when a new EchoMuse release is out, the dashboard shows an
-  update badge — one click updates the device over WiFi. If an update ever
+  update badge — one click updates the device over WiFi. The release notes
+  appear alongside it, so you can read what changed before deciding, rather
+  than judging by version number. If an update ever
   goes wrong, the device automatically rolls back to its previous version.
   **Deploy all** updates the whole fleet at once; it runs in the background,
   so you can close the dialog and reopen it from the header pill to check
@@ -178,6 +180,10 @@ The LED ring tells you what's happening:
    near-misses, nudge the sensitivity up a step (see configuration.md).
 3. Bad transcriptions? See the microphone section of
    [voice-pipeline.md](voice-pipeline.md) — room noise and speaker distance
-   are the usual suspects.
+   are the usual suspects. To stop guessing, turn on **Save utterances**
+   (Config → Microphones → Advanced) and *listen* to what the Dot heard —
+   the Activity tab gains a play button on each turn. It's off by default
+   because it stores speech on your server; see
+   [configuration.md](configuration.md) for exactly what's kept.
 4. The troubleshooting section of [SETUP.md](../SETUP.md) covers the deeper
    stuff.

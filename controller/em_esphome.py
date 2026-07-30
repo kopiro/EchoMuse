@@ -68,6 +68,7 @@ from zeroconf import ServiceInfo
 import em_db as db
 import em_api as api
 import em_ns
+import em_recordings
 import em_oww_models
 import em_player
 
@@ -1010,6 +1011,15 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         ns_debug_raw = bytearray()
         ns_debug_out = bytearray()
 
+        # Utterance capture (saveUtterances): keep what was sent to HA for
+        # recognition, so it can be listened to from the Activity tab. The
+        # buffer is filled POST-NS, further down this loop — see the comment
+        # at the tap. Read once per turn, so toggling the setting mid-turn
+        # can't leave a half-recorded stream. Cleared unconditionally: a stale
+        # buffer from an earlier turn must never be attributed to this one.
+        capture     = bytearray() if getattr(device, "save_utterances", False) else None
+        device.last_utterance_pcm = None
+
         # Preroll discard — drop wake-word tail from voice_queue before
         # streaming to HA. Wake turns pass VOICE_PREROLL_DISCARD; button and
         # continuation turns pass 0 (see C3 — they have no wake-word tail to
@@ -1192,6 +1202,17 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                             ns_debug_raw.extend(raw_payload)
                             ns_debug_out.extend(payload)
 
+                # Utterance capture sits HERE, below the denoiser, so the saved
+                # file is byte-for-byte what goes on the wire to HA — i.e. what
+                # STT actually heard. Tapping above NS (as this first shipped)
+                # answered "how good is the mic" but could not answer "why was
+                # the transcript wrong" on any device with nsAsr on, which is
+                # the question people actually ask. If NS fails mid-turn the
+                # payload falls back to raw for the rest of the turn and the
+                # capture follows it, which stays correct by construction.
+                if capture is not None and len(capture) < em_recordings.MAX_UTTERANCE_BYTES:
+                    capture.extend(payload)
+
                 if self._trace:
                     self._trace.audio_frames += 1
                 pcm_buf.extend(payload)
@@ -1207,6 +1228,12 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             # Validation tooling: when NS_DEBUG_DIR is set, persist what
             # STT actually received next to what the mic actually sent.
             em_ns.dump_debug_pair(self._log_name, bytes(ns_debug_raw), bytes(ns_debug_out))
+            # Hand the captured utterance to _persist_turn, which owns the
+            # write (it has the rowid the filename is keyed on). In `finally`
+            # so a cancelled or errored turn still saves what it heard —
+            # those are exactly the turns worth listening back to.
+            if capture:
+                device.last_utterance_pcm = bytes(capture)
 
     def disconnect(self) -> None:
         """
@@ -1672,6 +1699,46 @@ async def _record_dropped_turn(device, trigger_label: str, wake_info) -> None:
     device.turn_history.append(turn_record)
 
 
+async def _save_utterance(device, turn_id: int, turn_record: dict) -> None:
+    """
+    Write the turn's captured mic audio (if saveUtterances is on) to
+    recordings/ and record the filename on the turn row.
+
+    Runs after the insert because the filename is keyed on the rowid. The
+    buffer is consumed here — a turn that never streamed audio must not
+    inherit the previous turn's recording, and holding ~1MB of speech on
+    the Device past its one use has no upside.
+
+    Best-effort throughout: a full disk or a read-only volume costs the
+    recording, never the turn.
+    """
+    pcm = getattr(device, "last_utterance_pcm", None)
+    device.last_utterance_pcm = None
+    if not pcm:
+        return
+    try:
+        name = await asyncio.get_running_loop().run_in_executor(
+            None, em_recordings.save, device.device_id, turn_id, pcm
+        )
+    except Exception as e:
+        log.warning(f"[{device.device_id}] Utterance save failed: {e}")
+        return
+    if not name:
+        return
+    turn_record["audio_file"] = name
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, db.set_turn_audio, turn_id, name
+        )
+    except Exception as e:
+        log.warning(f"[{device.device_id}] Utterance link failed: {e}")
+        return
+    log.info(
+        f"[{device.device_id}] Utterance saved: {name} "
+        f"({em_recordings.duration_ms(len(pcm)) / 1000:.1f}s)"
+    )
+
+
 async def _persist_turn(device, turn_record: dict) -> None:
     """
     Write a completed turn to SQLite (survives controller restarts) and
@@ -1703,11 +1770,45 @@ async def _persist_turn(device, turn_record: dict) -> None:
             turn_record["send_ms"] = device.playback_send_ms
             turn_record["eq_ms"]   = device.playback_eq_ms
         pending = None
+    # On-device shadow comparison (schema v13): when THIS controller woke, did
+    # the device's own scoring agree, and how far apart were they? Correlated
+    # here rather than at detection time on purpose — the device's crossing
+    # report travels over the control plane and can land after the wake it
+    # belongs to, and by turn end it has had seconds to arrive.
+    #
+    # dev_shadow records whether the device was scoring at all, so a NULL score
+    # beside a 1 is a genuine miss while a NULL beside a NULL is just absence of
+    # data. Only for wake-triggered turns: a button press has no wake instant to
+    # compare against, and writing 0 there would invent a miss.
+    wake_mono = device.last_wake_mono
+    device.last_wake_mono = None
+    if wake_mono is not None and str(turn_record.get("trigger", "")).startswith("wakeword"):
+        dev_score, dev_delta = device.shadow.match(wake_mono)
+        turn_record["dev_shadow"]        = 1 if device.shadow.active else None
+        turn_record["dev_wake_score"]    = dev_score
+        turn_record["dev_wake_delta_ms"] = dev_delta
+        # The bar the DEVICE was using. Without it a non-crossing cannot be
+        # judged: this controller may have woken at a lower barge-in threshold,
+        # which the device was never asked to match.
+        turn_record["dev_threshold"]     = device.shadow.threshold
+        if device.shadow.active:
+            log.info(
+                f"[{device.device_id}] shadow comparison: controller "
+                f"{turn_record.get('wake_score')} vs device "
+                f"{dev_score if dev_score is not None else 'MISS'}"
+                + (f" ({dev_delta:+d}ms)" if dev_delta is not None else "")
+            )
+
+    # Surface the outcome to the turn loop's ring cleanup. Without this
+    # every ending looks identical to the user — "I didn't hear you",
+    # "HA errored" and "done, nothing to say" all just turn the ring off.
+    device.last_turn_outcome = turn_record.get("outcome")
     try:
         turn_id = await loop.run_in_executor(
             None, db.insert_turn, device.device_id, turn_record
         )
         turn_record["turn_id"] = turn_id
+        await _save_utterance(device, turn_id, turn_record)
         if played and "underruns" not in turn_record:
             # Playback happened but its stats haven't arrived — leave the
             # rendezvous open for handle_control's playback_stats branch.
