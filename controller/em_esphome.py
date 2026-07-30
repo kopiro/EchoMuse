@@ -40,8 +40,8 @@ Voice turn flow:
   5. Sends VoiceAssistantAudio(end=True) on VAD sentinel
   6. Receives VoiceAssistantEventResponse stream from HA (RUN_START,
      STT_END, TTS_START, etc — see ESPHOME_SPEC.md §4)
-  7. VoiceAssistantAnnounceRequest carries TTS audio URL → fetch + play
-     via existing device speaker pipeline (_run_post_turn_playback)
+  7. HA's TTS URL is decoded and played incrementally through the device
+     speaker pipeline while Assist is still producing utterances
   8. Sends VoiceAssistantAnnounceFinished when playback completes
 
 Cancel (esphome mode):
@@ -58,7 +58,7 @@ import os
 import socket
 import time
 import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import AsyncIterator, TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -289,6 +289,11 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         self._tts_audio_url:    Optional[str] = None
         self._tts_audio_data:   Optional[bytes] = None
         self._tts_event         = asyncio.Event()
+        # A text-originated Assist pipeline has no active microphone turn to
+        # consume TTS_END. Keep that path separate from announcement handling:
+        # its URL is a live ResultStream and must be decoded while bytes arrive,
+        # whereas ESPHome AnnounceRequest media is deliberately fetched in full.
+        self._external_tts_task: Optional[asyncio.Task] = None
         self._conversation_id:  str = ""
         self._trace:            "TurnTrace | None" = None
         # Set on VOICE_ASSISTANT_INTENT_END — the reliable "STT + intent
@@ -593,6 +598,18 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 self._trace.t_tts_url_ms = self._trace.elapsed_ms()
             self._tts_audio_url = url
             self._tts_event.set()
+            if url and not self._turn_active:
+                if (
+                    self._external_tts_task is not None
+                    and not self._external_tts_task.done()
+                ):
+                    log.warning(
+                        f"[{self._log_name}] Ignoring overlapping external TTS URL"
+                    )
+                else:
+                    self._external_tts_task = asyncio.create_task(
+                        self._stream_external_tts(url)
+                    )
 
         elif event_type == ET.VOICE_ASSISTANT_RUN_END:
             log.info(f"[{self._log_name}] Pipeline run ended")
@@ -625,6 +642,43 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             # stream stays parked until the device's own gate closes.
             self._ha_vad_end.set()
             self._tts_event.set()  # unblock turn waiter
+
+    async def _stream_external_tts(self, url: str) -> None:
+        """Stream a text-originated pipeline response without a microphone turn."""
+        try:
+            stream_cb = (
+                self._owning_server._standalone_stream_play
+                if self._owning_server is not None
+                else None
+            )
+            if stream_cb is None:
+                log.warning(
+                    f"[{self._log_name}] External TTS has no streaming playback "
+                    f"callback"
+                )
+                return
+
+            # Pass the iterator through untouched. Buffering it here would make
+            # dashboard-originated speech wait for the complete model response
+            # and silently undo the latency benefit of the HA ResultStream.
+            log.info(f"[{self._log_name}] Streaming external TTS audio from {url}")
+            await stream_cb(_stream_tts_audio(url))
+        except Exception as exc:
+            log.error(f"[{self._log_name}] External TTS stream failed: {exc}")
+        finally:
+            self._external_tts_task = None
+            if self._transport and not self._transport.is_closing():
+                self._send_one(
+                    api_pb2.VoiceAssistantAnnounceFinished(success=True)
+                )
+                self._send_one(
+                    api_pb2.MediaPlayerStateResponse(
+                        key=MEDIA_PLAYER_KEY,
+                        state=MediaPlayerState.IDLE,
+                        volume=self._current_volume,
+                        muted=False,
+                    )
+                )
 
     # ── Announcement handling ────────────────────────────────────────────
 
@@ -692,7 +746,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         self,
         device,            # em_controller.Device — avoids circular import
         on_thinking,       # async callable()
-        post_turn_play,    # async callable(voice_response: bytes)
+        post_turn_play,    # async callable(pcm_chunks) -> decoded byte count
         trace: "TurnTrace | None" = None,
         preroll_discard: int = VOICE_PREROLL_DISCARD,
     ) -> None:
@@ -701,12 +755,12 @@ class EchoMuseSatellite(SatelliteServerProtocol):
 
         Called by trigger_voice_turn() in the controller, with device.voice_lock
         already held. Streams mic audio to HA, waits for TTS response, and
-        hands PCM to post_turn_play() for device-side playback.
+        hands a decoded PCM stream to post_turn_play() for device playback.
 
         on_thinking() is called when STT_VAD_END arrives — the LED/state
         transition point into the thinking phase.
-        post_turn_play(pcm_bytes) wraps _run_post_turn_playback() —
-        EQ, resample, stream_speaker, acoustic-feedback drain.
+        post_turn_play(pcm_chunks) wraps the controller's streaming playback
+        path: stateful EQ, stream_speaker, and acoustic-feedback drain.
 
         preroll_discard: number of ~80ms voice_queue frames to drop before
         streaming to HA. Wake-word turns pass VOICE_PREROLL_DISCARD (removes
@@ -783,14 +837,17 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 # Device gave up locally before any speech was detected —
                 # _stream_mic_audio already skipped sending end=True to HA,
                 # so there's no in-flight HA pipeline to wait on. Close the
-                # turn immediately rather than sitting on the 30s TTS wait
+                # turn immediately rather than sitting on the TTS wait
                 # for a response that was never requested.
                 if trace: trace.outcome = "no_speech"
                 return
 
             # ── Wait for TTS response (or RUN_END / error / timeout) ──────
             try:
-                await asyncio.wait_for(self._tts_event.wait(), timeout=30.0)
+                # HA tool calls can legitimately include waking a TV and waiting
+                # for its Cast receiver, so allow the final response to arrive
+                # after those bounded actions complete.
+                await asyncio.wait_for(self._tts_event.wait(), timeout=90.0)
             except asyncio.TimeoutError:
                 log.warning(f"[{self._log_name}] Timeout waiting for TTS response from HA")
                 if trace: trace.outcome = "timeout"
@@ -802,22 +859,27 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 return
 
             if self._tts_audio_url:
-                # ── Fetch TTS audio and play it ───────────────────────────
-                log.info(f"[{self._log_name}] Fetching TTS audio from {self._tts_audio_url}")
+                # HA deliberately keeps a streaming TTS response open while
+                # new utterances are synthesized. Buffering it with resp.read()
+                # postpones all playback until the final sentence and erases
+                # the latency benefit of Assist's streaming contract.
+                log.info(f"[{self._log_name}] Streaming TTS audio from {self._tts_audio_url}")
                 try:
-                    pcm_bytes = await _fetch_tts_audio(self._tts_audio_url)
+                    if trace:
+                        trace.t_playback_ms = trace.elapsed_ms()
+                    pcm_bytes = await post_turn_play(
+                        _stream_tts_audio(self._tts_audio_url)
+                    )
                 except Exception as e:
-                    log.error(f"[{self._log_name}] TTS audio fetch failed: {e}")
+                    log.error(f"[{self._log_name}] TTS audio stream failed: {e}")
                     if trace: trace.outcome = "tts_error"
                     return
 
                 if trace:
                     trace.t_tts_fetched_ms = trace.elapsed_ms()
-                    trace.tts_bytes = len(pcm_bytes) if pcm_bytes else 0
+                    trace.tts_bytes = pcm_bytes or 0
 
                 if pcm_bytes and not self._turn_cancelled:
-                    if trace: trace.t_playback_ms = trace.elapsed_ms()
-                    await post_turn_play(pcm_bytes)
                     if trace: trace.outcome = "ok"
             else:
                 log.info(f"[{self._log_name}] No TTS audio URL received — turn ended without response")
@@ -1173,6 +1235,97 @@ class EchoMuseSatellite(SatelliteServerProtocol):
 
 # ─── TTS audio fetch ─────────────────────────────────────────────────────────
 
+async def _stream_tts_audio(url: str) -> AsyncIterator[bytes]:
+    """
+    Incrementally fetch and decode HA TTS audio to 48kHz mono S16_LE PCM.
+
+    The HTTP response is piped into one long-lived ffmpeg process while decoded
+    PCM is yielded immediately. Neither the encoded response nor decoded speech
+    is accumulated in memory. A retry is safe only before PCM has been emitted;
+    retrying later would repeat audio the user has already heard.
+    """
+    emitted = False
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with asyncio.timeout(105):
+                async for pcm in _stream_tts_audio_once(url):
+                    emitted = True
+                    yield pcm
+            return
+        except Exception as err:
+            last_exc = err
+            if attempt == 0 and not emitted:
+                log.warning(
+                    f"_stream_tts_audio: stream failed before playback ({err}) "
+                    "— retrying once"
+                )
+                await asyncio.sleep(0.5)
+                continue
+            raise
+
+    raise last_exc
+
+
+async def _stream_tts_audio_once(url: str) -> AsyncIterator[bytes]:
+    """Run one HTTP-to-ffmpeg streaming attempt for _stream_tts_audio."""
+    import aiohttp
+
+    proc: asyncio.subprocess.Process | None = None
+    feeder: asyncio.Task | None = None
+    try:
+        timeout = aiohttp.ClientTimeout(
+            total=90,
+            connect=10,
+            sock_connect=10,
+            sock_read=60,
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-i", "pipe:0",
+                    "-f", "s16le", "-ar", "48000", "-ac", "1",
+                    "pipe:1",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                async def _feed_encoded_audio() -> None:
+                    assert proc is not None and proc.stdin is not None
+                    try:
+                        async for chunk in resp.content.iter_chunked(16 * 1024):
+                            proc.stdin.write(chunk)
+                            await proc.stdin.drain()
+                    finally:
+                        if not proc.stdin.is_closing():
+                            proc.stdin.close()
+                            await proc.stdin.wait_closed()
+
+                feeder = asyncio.create_task(_feed_encoded_audio())
+                assert proc.stdout is not None
+                while pcm := await proc.stdout.read(16 * 1024):
+                    yield pcm
+
+                await feeder
+                assert proc.stderr is not None
+                err = await proc.stderr.read()
+                return_code = await asyncio.wait_for(proc.wait(), timeout=15.0)
+                if return_code != 0:
+                    raise RuntimeError(
+                        f"ffmpeg streaming decode failed: {err.decode()[:200]}"
+                    )
+    finally:
+        if feeder is not None and not feeder.done():
+            feeder.cancel()
+            await asyncio.gather(feeder, return_exceptions=True)
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
 async def _fetch_tts_audio(url: str) -> bytes:
     """
     Fetch TTS audio from HA and decode to 48kHz mono S16_LE PCM — the
@@ -1196,19 +1349,6 @@ async def _fetch_tts_audio(url: str) -> bytes:
     for attempt in range(2):
         try:
             async with aiohttp.ClientSession() as session:
-                # 60s, not 10s: HA's tts_proxy generates the audio while we
-                # hold this GET open, so this is a synthesis deadline, not a
-                # download one. Whether that shows up here or in tts_gen
-                # depends on the engine — a streaming-capable one hands over
-                # the URL early and does the work during the fetch, which is
-                # how a long response (a read-aloud story) blew the old 10s
-                # cap. Reported by @kopiro in #28.
-                #
-                # The proper fix is to stop buffering the whole response:
-                # em_player already streams a URL through ffmpeg into the
-                # same 0x02 plane with StreamingEQ, and pointing that at TTS
-                # would remove this deadline AND start playback seconds
-                # sooner. Until then this is a deliberate band-aid.
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                     resp.raise_for_status()
                     audio_bytes = await resp.read()
@@ -1279,6 +1419,9 @@ class DeviceESPhomeServer:
         # standalone announce playback (setup wizard, push TTS) when no
         # voice turn is active.
         self._standalone_play = None
+        # Unlike _standalone_play, this callback accepts an async iterator and
+        # preserves a streamed HA TTS response as one decoder/EQ/device session.
+        self._standalone_stream_play = None
         # Injected by device_connected() — async callable(level: int) that
         # sends a volume_set control-plane message to the physical device.
         # None when no device is connected.
@@ -1588,7 +1731,7 @@ async def _persist_turn(device, turn_record: dict) -> None:
 async def trigger_voice_turn(
     device,           # em_controller.Device
     on_thinking,      # async callable() — LED/state transition
-    post_turn_play,   # async callable(pcm_bytes: bytes) — playback + drain
+    post_turn_play,   # async callable(pcm_chunks) -> decoded byte count
     trigger_label: str = "unknown",  # "wakeword(0.522)" or "button" for trace
     preroll_discard: int = VOICE_PREROLL_DISCARD,
 ) -> bool:
@@ -1716,6 +1859,7 @@ async def device_connected(
     device_id: str,
     host: str = "0.0.0.0",
     standalone_play=None,
+    standalone_stream_play=None,
     send_volume_set=None,
 ) -> None:
     """
@@ -1729,6 +1873,10 @@ async def device_connected(
     speaker pipeline for standalone announces (setup wizard audio test,
     push TTS) when no voice turn is active. Provided by the controller
     as a closure over the Device object.
+
+    standalone_stream_play: async callable(pcm_chunks) — consumes a live PCM
+    iterator for a text-originated Assist pipeline. This is intentionally
+    distinct from standalone_play so ordinary announcements remain buffered.
 
     send_volume_set: async callable(level: int) — sends a volume_set
     control-plane message to the physical device. Provided by the controller
@@ -1749,6 +1897,7 @@ async def device_connected(
             return
         server = await _register_device_server(device_id, row["label"])
     server._standalone_play = standalone_play
+    server._standalone_stream_play = standalone_stream_play
     server._send_volume_set = send_volume_set
     if server._server is not None:
         log.debug(f"[esphome.{device_id[-8:]}] device_connected: port {server.port} already listening")
