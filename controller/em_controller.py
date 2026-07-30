@@ -1208,6 +1208,7 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
                     spin_task = asyncio.create_task(
                         leds_spin_green(device, stop_spin)
                     )
+                meter_refresh_task = None
                 if device.led_anim_capable:
                     # Playback ring: throb with the response's live audio
                     # level (device-side "meter" pattern, RMS measured at
@@ -1215,15 +1216,24 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
                     # the device; spin_task keeps waiting on stop_event
                     # and its finally still clears the ring at turn end.
                     #
-                    # TTL is sized to THIS response — a fixed dead-man would
-                    # eventually clear the ring part-way through a long
-                    # answer, which is the very bug being fixed elsewhere in
-                    # this turn path.
+                    # A streamed response has no known duration up front.
+                    # Refresh the same bounded dead-man TTL while PCM arrives:
+                    # long speech cannot outlive its meter, but a controller
+                    # crash still lets the device clear the ring on its own.
                     meter = dict(device.led_scene["meter_anim"])
-                    meter["ttlSec"] = em_scenes.meter_ttl(
-                        len(voice_response) / (SPEAKER_RATE * 2)
-                    )
+                    meter["ttlSec"] = em_scenes.meter_ttl(0.0)
                     await device.send_led_anim(meter)
+
+                    async def _refresh_meter_dead_man() -> None:
+                        refresh_seconds = max(1.0, meter["ttlSec"] / 2)
+                        while True:
+                            await asyncio.sleep(refresh_seconds)
+                            await device.send_led_anim(meter)
+
+                    meter_refresh_task = asyncio.create_task(
+                        _refresh_meter_dead_man()
+                    )
+
                 if device.barge_in_enabled:
                     # Barge-in (§3.2): keep the mic running through
                     # playback — the device's AEC subtracts the speaker
@@ -1244,23 +1254,29 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
                         watcher = asyncio.create_task(
                             _barge_watcher(device, playback_started)
                         )
+                else:
+                    # Acoustic-feedback guard (barge-in off): stop the mic
+                    # BEFORE playback, not just in the post-turn finally.
+                    # With the mic running through TTS pre-AEC, the device
+                    # processed its own speaker echo (63-65 junk frames per
+                    # turn measured 2026-07-06) and sent it upstream on the
+                    # same Wi-Fi radio receiving the TTS frames (speaker
+                    # underruns → audible stutter). The finally's mic_stop
+                    # stays as a safety net (StopMic no-ops when already
+                    # stopped); restart is owned by the continuation branch /
+                    # wake listener / button handler as before.
+                    await device.mic_stop()
+
+                try:
                     return await _run_streaming_post_turn_playback(
                         device, pcm_chunks
                     )
-                # Acoustic-feedback guard (barge-in off): stop the mic
-                # BEFORE playback, not just in the post-turn finally.
-                # With the mic running through TTS pre-AEC, the device
-                # processed its own speaker echo (63-65 junk frames per
-                # turn measured 2026-07-06) and sent it upstream on the
-                # same Wi-Fi radio receiving the TTS frames (speaker
-                # underruns → audible stutter). The finally's mic_stop
-                # stays as a safety net (StopMic no-ops when already
-                # stopped); restart is owned by the continuation branch /
-                # wake listener / button handler as before.
-                await device.mic_stop()
-                return await _run_streaming_post_turn_playback(
-                    device, pcm_chunks
-                )
+                finally:
+                    if meter_refresh_task is not None:
+                        meter_refresh_task.cancel()
+                        await asyncio.gather(
+                            meter_refresh_task, return_exceptions=True
+                        )
 
             # P0-1: no mic_start_turn() here on the initial (wake/button)
             # entry — for a wake turn the stream is already running on
