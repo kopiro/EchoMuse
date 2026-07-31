@@ -290,6 +290,12 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         self._tts_audio_url:    Optional[str] = None
         self._tts_audio_data:   Optional[bytes] = None
         self._tts_event         = asyncio.Event()
+        # A text-originated Assist pipeline has no active microphone turn to
+        # consume TTS_END. Keep that path separate from announcement handling:
+        # its URL is a live ResultStream and must be decoded while bytes arrive,
+        # whereas ESPHome AnnounceRequest media deliberately keeps the existing
+        # fetch-before-play contract.
+        self._external_tts_task: Optional[asyncio.Task] = None
         self._conversation_id:  str = ""
         self._trace:            "TurnTrace | None" = None
         # Set on VOICE_ASSISTANT_INTENT_END — the reliable "STT + intent
@@ -594,6 +600,18 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 self._trace.t_tts_url_ms = self._trace.elapsed_ms()
             self._tts_audio_url = url
             self._tts_event.set()
+            if url and not self._turn_active:
+                if (
+                    self._external_tts_task is not None
+                    and not self._external_tts_task.done()
+                ):
+                    log.warning(
+                        f"[{self._log_name}] Ignoring overlapping external TTS URL"
+                    )
+                else:
+                    self._external_tts_task = asyncio.create_task(
+                        self._stream_external_tts(url)
+                    )
 
         elif event_type == ET.VOICE_ASSISTANT_RUN_END:
             log.info(f"[{self._log_name}] Pipeline run ended")
@@ -626,6 +644,43 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             # stream stays parked until the device's own gate closes.
             self._ha_vad_end.set()
             self._tts_event.set()  # unblock turn waiter
+
+    async def _stream_external_tts(self, url: str) -> None:
+        """Stream a text-originated pipeline response without a microphone turn."""
+        try:
+            stream_cb = (
+                self._owning_server._standalone_stream_play
+                if self._owning_server is not None
+                else None
+            )
+            if stream_cb is None:
+                log.warning(
+                    f"[{self._log_name}] External TTS has no streaming playback "
+                    f"callback"
+                )
+                return
+
+            # Pass the iterator through untouched. Buffering it here would make
+            # dashboard-originated speech wait for the complete model response
+            # and silently undo the latency benefit of the HA ResultStream.
+            log.info(f"[{self._log_name}] Streaming external TTS audio from {url}")
+            await stream_cb(_stream_tts_audio(url))
+        except Exception as exc:
+            log.error(f"[{self._log_name}] External TTS stream failed: {exc}")
+        finally:
+            self._external_tts_task = None
+            if self._transport and not self._transport.is_closing():
+                self._send_one(
+                    api_pb2.VoiceAssistantAnnounceFinished(success=True)
+                )
+                self._send_one(
+                    api_pb2.MediaPlayerStateResponse(
+                        key=MEDIA_PLAYER_KEY,
+                        state=MediaPlayerState.IDLE,
+                        volume=self._current_volume,
+                        muted=False,
+                    )
+                )
 
     # ── Announcement handling ────────────────────────────────────────────
 
@@ -1427,6 +1482,9 @@ class DeviceESPhomeServer:
         # standalone announce playback (setup wizard, push TTS) when no
         # voice turn is active.
         self._standalone_play = None
+        # Unlike _standalone_play, this callback accepts an async iterator and
+        # preserves a streamed HA TTS response as one decoder/EQ/device session.
+        self._standalone_stream_play = None
         # Injected by device_connected() — async callable(level: int) that
         # sends a volume_set control-plane message to the physical device.
         # None when no device is connected.
@@ -1938,6 +1996,7 @@ async def device_connected(
     device_id: str,
     host: str = "0.0.0.0",
     standalone_play=None,
+    standalone_stream_play=None,
     send_volume_set=None,
 ) -> None:
     """
@@ -1951,6 +2010,10 @@ async def device_connected(
     speaker pipeline for standalone announces (setup wizard audio test,
     push TTS) when no voice turn is active. Provided by the controller
     as a closure over the Device object.
+
+    standalone_stream_play: async callable(pcm_chunks) — consumes a live PCM
+    iterator for a text-originated Assist pipeline. This is intentionally
+    distinct from standalone_play so ordinary announcements remain buffered.
 
     send_volume_set: async callable(level: int) — sends a volume_set
     control-plane message to the physical device. Provided by the controller
@@ -1971,6 +2034,7 @@ async def device_connected(
             return
         server = await _register_device_server(device_id, row["label"])
     server._standalone_play = standalone_play
+    server._standalone_stream_play = standalone_stream_play
     server._send_volume_set = send_volume_set
     if server._server is not None:
         log.debug(f"[esphome.{device_id[-8:]}] device_connected: port {server.port} already listening")

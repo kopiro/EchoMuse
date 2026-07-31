@@ -2121,12 +2121,27 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             finally:
                 await _d.mic_start()
                 await em_player.resume_interrupted(_d.device_id)
+
+        async def _standalone_stream_play(pcm_chunks, _d=_device_ref) -> int:
+            # Text-originated HA pipelines have no active microphone turn, but
+            # their TTS URL is still a live ResultStream. Reuse the voice-turn
+            # streaming player so decoding, stateful EQ and the speaker session
+            # remain continuous from the first chunk to the last.
+            await em_player.interrupt(_d.device_id)
+            await _d.mic_stop()
+            try:
+                return await _run_streaming_post_turn_playback(_d, pcm_chunks)
+            finally:
+                await _d.mic_start()
+                await em_player.resume_interrupted(_d.device_id)
+
         async def _send_volume_set(level: int, _d=_device_ref) -> None:
             await _d.send_control({"type": "volume_set", "level": level})
         await esphome.device_connected(
             device_id,
             SERVER_HOST,
             standalone_play=_standalone_play,
+            standalone_stream_play=_standalone_stream_play,
             send_volume_set=_send_volume_set,
         )
         # The ESPHome server object caches the OWW model from server
