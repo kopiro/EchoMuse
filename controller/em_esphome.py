@@ -707,33 +707,46 @@ class EchoMuseSatellite(SatelliteServerProtocol):
         setup wizard doesn't time out waiting for the response. Audio playback
         happens asynchronously — if it fails, the wizard has already passed.
 
-        During a voice turn, _on_announce is set by run_esphome_voice_turn()
-        and takes priority — it routes audio to the device's speaker pipeline
-        as part of the in-progress turn. Outside a turn (setup wizard,
-        standalone push TTS), _on_announce is always None by design (it's
-        turn-scoped — see the attribute's docstring in __init__), so we read
-        self._owning_server._standalone_play directly instead. This has to be
-        a live read, not a copy taken at connect time: _standalone_play is
-        set by em_controller.py's device_connected() on the physical Echo
-        Dot's own connect event, which is independent of and not ordered
-        relative to HA's ESPHome TCP connect — copying it once into
-        self._on_announce at construction (the original approach) meant the
-        callback was frequently still None at that point even though the
-        device was really connected, since device_connected() just hadn't
-        run yet for this session. Confirmed in practice: this fired as
-        "no playback callback set" on freshly-established connections, not
-        just stale reconnects, which ruled out a staleness-only explanation.
+        During a voice turn, _on_announce remains the turn-scoped buffered
+        callback. Outside a turn, preserve HA's HTTP response as a live stream:
+        Otto TTS implements streaming input even for a complete message and
+        produces provider-sized utterances progressively. Reading the entire
+        response here would silently turn that valid stream back into buffered
+        speech and make script.otto_output wait for every sentence.
+
+        Both standalone callbacks must be read live from the owning server.
+        They are installed when the physical Dot connects, independently of
+        HA's ESPHome TCP connection, so copying either callback when this
+        protocol object is constructed can capture None and lose playback on
+        an otherwise healthy fresh connection.
         """
         if not media_id:
             return
         try:
+            play_cb = self._on_announce
+            if play_cb is None:
+                stream_cb = (
+                    self._owning_server._standalone_stream_play
+                    if self._owning_server is not None
+                    else None
+                )
+                if stream_cb is not None:
+                    log.info(
+                        f"[{self._log_name}] Streaming standalone announce "
+                        f"audio from {media_id}"
+                    )
+                    await stream_cb(_stream_tts_audio(media_id))
+                    return
+
+                play_cb = (
+                    self._owning_server._standalone_play
+                    if self._owning_server is not None
+                    else None
+                )
+
             pcm_bytes = await _fetch_tts_audio(media_id)
             if not pcm_bytes:
                 return
-
-            play_cb = self._on_announce
-            if play_cb is None and self._owning_server is not None:
-                play_cb = self._owning_server._standalone_play
 
             if play_cb:
                 await play_cb(pcm_bytes)
